@@ -655,11 +655,20 @@ int main(int argc, char **argv) {
     // byte-identically to a build without this option at all.
     const float gain_lin = emusc_tools::gain_db_to_linear(o.gain_db);
 
+    // Frames are rendered a block at a time; each block's events are queued
+    // before it, still EVENT_LEAD_FRAMES ahead of the block's first frame,
+    // which leaves every event of the block itself queued in time.
+    const uint64_t RENDER_BLOCK_FRAMES = 256;
+    static_assert(RENDER_BLOCK_FRAMES <= EVENT_LEAD_FRAMES,
+                  "a block's own events must be queued before it renders");
+    std::vector<float> rendered(2 * RENDER_BLOCK_FRAMES);
     size_t next = 0;
-    for (uint64_t fr = 0; fr < total_frames; fr++) {
-      while (next < sched.size() && sched[next].frame <= fr + EVENT_LEAD_FRAMES) {
+    for (uint64_t base = 0; base < total_frames; base += RENDER_BLOCK_FRAMES) {
+      const uint64_t count =
+        std::min<uint64_t>(RENDER_BLOCK_FRAMES, total_frames - base);
+      while (next < sched.size() && sched[next].frame <= base + EVENT_LEAD_FRAMES) {
         const smf::Event &e = *sched[next].ev;
-        const uint32_t off = static_cast<uint32_t>(sched[next].frame - fr);
+        const uint32_t off = static_cast<uint32_t>(sched[next].frame - base);
         if (e.kind == smf::Kind::Channel) {
           const uint8_t port =
             (e.track >= 0 && (size_t) e.track < trackPort.size())
@@ -678,59 +687,61 @@ int main(int argc, char **argv) {
         }
         next++;
       }
-      float l = 0.0f, r = 0.0f;
-      synth.get_next_frame(l, r);
-      emusc_tools::apply_gain(l, r, gain_lin);
-      // Float output has no quantization step of its own to clamp it, so a
-      // requested gain that pushes a sample past +-1.0 is clamped here
-      // explicitly; skipped along with apply_gain() itself when no gain was
-      // requested, so a default render's float samples are never touched.
-      if (o.gain_db != 0.0 && o.as_float) {
-        if (l > 1.0f) l = 1.0f; else if (l < -1.0f) l = -1.0f;
-        if (r > 1.0f) r = 1.0f; else if (r < -1.0f) r = -1.0f;
-      }
-      for (float v : {l, r})
-        if (std::fabs(v) >= kFullScale) {
-          if (!full_scale++) first_full_scale = fr;
-          last_full_scale = fr;
+      synth.get_next_frames(rendered.data(), count);
+      for (uint64_t fr = base; fr < base + count; fr++) {
+        float l = rendered[2 * (fr - base)], r = rendered[2 * (fr - base) + 1];
+        emusc_tools::apply_gain(l, r, gain_lin);
+        // Float output has no quantization step of its own to clamp it, so a
+        // requested gain that pushes a sample past +-1.0 is clamped here
+        // explicitly; skipped along with apply_gain() itself when no gain was
+        // requested, so a default render's float samples are never touched.
+        if (o.gain_db != 0.0 && o.as_float) {
+          if (l > 1.0f) l = 1.0f; else if (l < -1.0f) l = -1.0f;
+          if (r > 1.0f) r = 1.0f; else if (r < -1.0f) r = -1.0f;
         }
-      if (wav) {
-        if (o.as_float) {
-          fbuf.push_back(l);
-          fbuf.push_back(r);
-          if (fbuf.size() >= 2 * 4096) { wav->write(fbuf.data(), fbuf.size() / 2); fbuf.clear(); }
-        } else {
-          buf.push_back(to_i16(l));
-          buf.push_back(to_i16(r));
-          if (buf.size() >= 2 * 4096) { wav->write(buf.data(), buf.size() / 2); buf.clear(); }
+        for (float v : {l, r})
+          if (std::fabs(v) >= kFullScale) {
+            if (!full_scale++) first_full_scale = fr;
+            last_full_scale = fr;
+          }
+        if (wav) {
+          if (o.as_float) {
+            fbuf.push_back(l);
+            fbuf.push_back(r);
+            if (fbuf.size() >= 2 * 4096) { wav->write(fbuf.data(), fbuf.size() / 2); fbuf.clear(); }
+          } else {
+            buf.push_back(to_i16(l));
+            buf.push_back(to_i16(r));
+            if (buf.size() >= 2 * 4096) { wav->write(buf.data(), buf.size() / 2); buf.clear(); }
+          }
         }
-      }
-      if (audio_out) {
-        play_buf.push_back(to_i16(l));
-        play_buf.push_back(to_i16(r));
-        if (play_buf.size() >= 2 * (size_t) o.block) {
-          const auto compute_end = clock::now();
-          window_busy += compute_end - block_start;
-          overall_busy += compute_end - block_start;
+        if (audio_out) {
+          play_buf.push_back(to_i16(l));
+          play_buf.push_back(to_i16(r));
+          if (play_buf.size() >= 2 * (size_t) o.block) {
+            const auto compute_end = clock::now();
+            window_busy += compute_end - block_start;
+            overall_busy += compute_end - block_start;
 
-          audio_out->write(play_buf.data(), play_buf.size() / 2);
-          play_buf.clear();
+            audio_out->write(play_buf.data(), play_buf.size() / 2);
+            play_buf.clear();
 
-          const auto now = clock::now();
-          block_start = now;
-          if (now - window_start >= std::chrono::seconds(2)) {
-            using secs = std::chrono::duration<double>;
-            const double window_pct = 100.0 * secs(window_busy).count() /
-                                      secs(now - window_start).count();
-            const double overall_pct = 100.0 * secs(overall_busy).count() /
-                                       secs(now - render_start).count();
-            std::fprintf(stderr,
-                         "emusc-render: --play: CPU busy %.0f%% of wall "
-                         "time (window), %.0f%% (overall); lower = more "
-                         "headroom\n",
-                         window_pct, overall_pct);
-            window_start = now;
-            window_busy = clock::duration{};
+            const auto now = clock::now();
+            block_start = now;
+            if (now - window_start >= std::chrono::seconds(2)) {
+              using secs = std::chrono::duration<double>;
+              const double window_pct = 100.0 * secs(window_busy).count() /
+                                        secs(now - window_start).count();
+              const double overall_pct = 100.0 * secs(overall_busy).count() /
+                                         secs(now - render_start).count();
+              std::fprintf(stderr,
+                           "emusc-render: --play: CPU busy %.0f%% of wall "
+                           "time (window), %.0f%% (overall); lower = more "
+                           "headroom\n",
+                           window_pct, overall_pct);
+              window_start = now;
+              window_busy = clock::duration{};
+            }
           }
         }
       }

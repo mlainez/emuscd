@@ -97,6 +97,12 @@ public:
                         uint32_t frameOffset = 0, uint8_t port = 0);
 
   int get_next_frame(float &lOut, float &rOut);
+  // `frames` stereo frames, interleaved, into `out`: the same samples that
+  // many get_next_frame() calls would return, every queued MIDI event still
+  // applied at the frame it was queued for. A block lets the SC-88 and
+  // JV-1080 engines run each stage over many frames per call instead of
+  // one.
+  int get_next_frames(float *out, size_t frames);
   uint32_t get_num_clipped_samples(bool reset = true);
   std::array<int, 16> get_parts_last_peak_sample(void);
 

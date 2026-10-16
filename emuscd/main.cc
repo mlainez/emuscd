@@ -210,8 +210,8 @@ public:
   void run() {
     std::thread stdin_thread([this]() { read_stdin_commands(); });
 
-    std::vector<int16_t> out_buf;
-    out_buf.reserve(block_frames * 2);
+    std::vector<int16_t> out_buf(block_frames * 2);
+    std::vector<float> rendered(block_frames * 2);
     std::cout << "emuscd daemon running (device: " << device_name << "). "
               << "Type a device name to switch, or 'quit' to exit."
               << std::endl;
@@ -231,16 +231,17 @@ public:
         if (synth) handle_seq_event(ev);
       }
 
+      // A whole block per pass: the MIDI that arrived while the previous one
+      // was written is applied at its start.
       if (synth && pcm_out) {
-        float left = 0.0f, right = 0.0f;
-        synth->get_next_frame(left, right);
-        apply_gain(left, right, gain_lin);
-        out_buf.push_back(to_i16(left));
-        out_buf.push_back(to_i16(right));
-        if (out_buf.size() >= block_frames * 2) {
-          write_block(out_buf);
-          out_buf.clear();
+        synth->get_next_frames(rendered.data(), block_frames);
+        for (unsigned int i = 0; i < block_frames; i++) {
+          float left = rendered[i * 2], right = rendered[i * 2 + 1];
+          apply_gain(left, right, gain_lin);
+          out_buf[i * 2] = to_i16(left);
+          out_buf[i * 2 + 1] = to_i16(right);
         }
+        write_block(out_buf);
       } else {
         std::this_thread::yield();
       }
