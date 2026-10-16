@@ -52,8 +52,9 @@ md5 of every render matched main's on the Pi.
 
 About 2.5 G of the SC-88's saving is the startup unscramble; the rest is the
 segment loop, worth ~12% native wall time on one thread. The 32-bit Windows
-build under Wine renders SC-88 and JV-1080 3-5% faster than main, with an
-identical import table.
+build under Wine renders SC-88 and JV-1080 3-5% faster than main; its
+executables import exactly what main's do, and libemusc.dll adds only three
+libstdc++ operator new/delete entries.
 
 ## Verification
 
