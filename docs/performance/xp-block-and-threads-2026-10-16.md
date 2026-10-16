@@ -31,15 +31,18 @@ main at every thread count.
 
 Pi 2 B v1.1, 4x Cortex-A7 @ 900 MHz, `isolcpus=3` (3 usable cores),
 `--rate 32000 --max-seconds 60 --tail 0`, real-time ratio as printed by
-emusc-render. Same compiler and flags for both binaries. This build predates
-item 2 and the startup tables, so its 1-thread SC-88 figure is pessimistic.
+emusc-render, final build. Same compiler and flags for both binaries.
 
-| device / song    | main  | 1 thread | 2 threads | 3 threads |
-|------------------|-------|----------|-----------|-----------|
-| SC-88 J_LAGOON   | 0.79x | 0.81x    | 1.69x     | 2.15x     |
-| SC-88 ARCADIA    | 0.61x | 0.62x    | 1.31x     | 1.71x     |
-| JV-1080 RISE     | 0.76x | 1.15x    | 1.96x     | 2.60x     |
-| JV-1080 ARCADIA  | 0.50x | 0.70x    | 1.29x     | 1.82x     |
+| device / song    | main  | 1 thread | 3 threads |
+|------------------|-------|----------|-----------|
+| SC-88 J_LAGOON   | 0.79x | 1.00x    | 2.20x     |
+| SC-88 ARCADIA    | 0.60x | 0.76x    | 1.72x     |
+| JV-1080 RISE     | 0.76x | 1.15x    | 2.57x     |
+| JV-1080 ARCADIA  | 0.50x | 0.70x    | 1.81x     |
+
+At 3 threads user time stays at the 1-thread figure while wall time falls,
+and the 3-thread ratios did not move when the 1-thread SC-88 loop got
+faster: they are now bound by the serial part (effects, scheduler, join).
 
 md5 of every render matched main's on the Pi.
 
