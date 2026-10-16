@@ -1083,6 +1083,12 @@ struct Engine {
   /* Owned; allocated by the first engine_set_worker_pool_jv that sets a
      pool. */
   struct VoiceBatch *batch;
+  /* Decodes the waves a newly loaded patch or kit can play into the cache
+     before its notes ask for them, off the render path. Owned. */
+  BackgroundWorker *prefetch;
+  /* Parts whose records changed since their waves were last queued, bit
+     kParts for the rhythm set. */
+  uint32_t prefetch_parts;
 };
 
 void voice_batch_free(struct VoiceBatch *batch);
@@ -2869,6 +2875,75 @@ bool patch_groups(const struct xp_rom *rom, unsigned *common, unsigned *tone)
   return true;
 }
 
+/* The prefetch thread's task: one span into the cache. Reads only the
+   ROM and the bank bytes, which nothing writes after engine_create. */
+void prefetch_wave(void *context, const BackgroundWorker::Item &item)
+{
+  struct Engine *engine = (struct Engine *)context;
+  if (item.a >= XP_WAVE_BANK_COUNT)
+    return;
+  struct xp_wave_descriptor span;
+  std::memset(&span, 0, sizeof span);
+  span.address_a = item.b;
+  span.address_c = item.c;
+  (void)wave_cache_prefetch(&engine->wave_cache, xp_profile(&engine->rom),
+                            engine->banks[item.a], engine->bank_sizes[item.a],
+                            &span);
+}
+
+/* Every span a record can decode at any key, each queued once. */
+void queue_record(struct Engine *engine, const struct XpVoiceFieldMap *fields,
+                  const uint8_t *record, int keyShift,
+                  BackgroundWorker::Item *seen, unsigned *seenCount,
+                  unsigned seenCapacity, unsigned firstKey, unsigned keys)
+{
+  for (unsigned key = firstKey; key < firstKey + keys && key < 128u; ++key) {
+    BackgroundWorker::Item item;
+    if (!jv1080_voice_decode_span(&engine->rom, fields, record, key, keyShift,
+                                  &item.a, &item.b, &item.c))
+      continue;
+    bool queued = false;
+    for (unsigned i = 0; i < *seenCount && !queued; ++i)
+      queued = seen[i].a == item.a && seen[i].b == item.b &&
+        seen[i].c == item.c;
+    if (queued)
+      continue;
+    if (*seenCount < seenCapacity)
+      seen[(*seenCount)++] = item;
+    engine->prefetch->post(item);
+  }
+}
+
+/* The spans of every part and kit marked since the last block, resolved on
+   the render thread - the records are its to read - and decoded on the
+   prefetch thread. A burst of SysEx writes marks a part many times and
+   queues it once. */
+void queue_prefetch(struct Engine *engine)
+{
+  const uint32_t marked = engine->prefetch_parts;
+  engine->prefetch_parts = 0;
+  if (!engine->prefetch)
+    return;
+  const struct XpDeviceProfile *profile = xp_profile(&engine->rom);
+  static thread_local BackgroundWorker::Item seen[512];
+  for (unsigned part = 0; part < kParts; ++part) {
+    if (!(marked & (UINT32_C(1) << part)) || part == profile->rhythmPartIndex)
+      continue;
+    unsigned count = 0;
+    int keyShift = (int)(int8_t)engine->parts[part]
+      .part[profile->partFieldKeyShift];
+    for (unsigned t = 0; t < XP_JV1080_TONES_PER_PATCH; ++t)
+      queue_record(engine, &profile->toneFields, engine->parts[part].tone[t],
+                   keyShift, seen, &count, 512u, 0u, 128u);
+  }
+  if (marked & (UINT32_C(1) << kParts)) {
+    unsigned count = 0;
+    for (unsigned k = 0; k < kRhythmKeys; ++k)
+      queue_record(engine, &profile->rhythmNoteFields, engine->rhythm.note[k],
+                   0, seen, &count, 512u, profile->rhythmFirstKey + k, 1u);
+  }
+}
+
 /* Load a factory patch into a part, which is what a program change does
    once a bank has been selected. */
 bool load_patch(struct Engine *engine, unsigned part, unsigned bank,
@@ -2898,6 +2973,7 @@ bool load_patch(struct Engine *engine, unsigned part, unsigned bank,
     engine->parts[part].common[f] = (uint8_t)(value & 0xff);
   }
   (void)profile;
+  engine->prefetch_parts |= UINT32_C(1) << part;
   return true;
 }
 
@@ -2978,6 +3054,9 @@ bool engine_create(void **state, const struct xp_rom *rom,
   /* The manual's default for Default tempo; the unit's own power-on value
      is not read back. */
   engine->tempo_bpm = 120.0;
+  engine->prefetch = new (std::nothrow) BackgroundWorker(prefetch_wave,
+                                                        engine);
+  engine->wave_cache.guard = engine->prefetch;
   power_on_parts(engine);
   *state = engine;
   return true;
@@ -2988,6 +3067,10 @@ void engine_free(void *state)
   struct Engine *engine = (struct Engine *)state;
   if (!engine)
     return;
+  /* First: its thread decodes into the cache freed below. */
+  delete engine->prefetch;
+  engine->prefetch = nullptr;
+  engine->wave_cache.guard = nullptr;
   for (unsigned i = 0; i < kMaxVoices; ++i)
     free_voice(engine->voices + i);
   wave_cache_clear(&engine->wave_cache);
@@ -3747,6 +3830,7 @@ bool load_rhythm_set(struct Engine *engine, unsigned bank, unsigned program)
     }
   for (unsigned k = keys; k < kRhythmKeys; ++k)
     std::memset(engine->rhythm.note[k], 0, kRhythmNoteFields);
+  engine->prefetch_parts |= UINT32_C(1) << kParts;
   (void)profile;
   return true;
 }
@@ -4024,6 +4108,7 @@ bool engine_sysex_block(void *state, const uint8_t *address,
                              engine->rhythm.note[block -
                                                  profile->rhythmFirstKey],
                              kRhythmNoteFields);
+    engine->prefetch_parts |= UINT32_C(1) << kParts;
     return true;
   }
   if (part >= kParts)
@@ -4053,6 +4138,7 @@ bool engine_sysex_block(void *state, const uint8_t *address,
     packed_apply_wire_block(&engine->rom, toneGroup, offset, data, count,
                              engine->parts[part].tone[tone],
                              XP_JV1080_TONE_FIELDS);
+    engine->prefetch_parts |= UINT32_C(1) << part;
     return true;
   }
   return false;                  /* a rhythm key, or a block not held */
@@ -4412,6 +4498,8 @@ void engine_render_jv(void *state, float *stereo, size_t frames)
   struct Engine *engine = (struct Engine *)state;
   if (!engine || !stereo || !frames)
     return;
+  if (engine->prefetch_parts)
+    queue_prefetch(engine);
   if (!engine->resampling) {
     jv_render_native(engine, stereo, frames);
     return;

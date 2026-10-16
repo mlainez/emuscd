@@ -2206,6 +2206,23 @@ bool jv1080_voice_span(const struct xp_rom *rom,
   return true;
 }
 
+bool jv1080_voice_decode_span(const struct xp_rom *rom,
+                               const struct XpVoiceFieldMap *fields,
+                               const uint8_t *tone, unsigned key,
+                               int keyShift, unsigned *bank,
+                               uint32_t *first, uint32_t *last)
+{
+  struct xp_wave_element element;
+  if (!rom || !fields || !tone || !bank || !first || !last || key > 127u ||
+      !resolve_element(rom, fields, tone, key, keyShift, &element) ||
+      element.bank >= XP_WAVE_BANK_COUNT)
+    return false;
+  *bank = element.bank;
+  *first = element.bank_start;
+  *last = element.bank_end;
+  return true;
+}
+
 bool jv1080_patch_tone(const struct xp_rom *rom,
                         const struct xp_packed_record *patch, unsigned index,
                         uint8_t *tone, unsigned *patchLevel,

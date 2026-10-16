@@ -18,6 +18,8 @@
 #ifndef EMUSC_XP_COMMON_WORKER_POOL_H
 #define EMUSC_XP_COMMON_WORKER_POOL_H
 
+#include <stdint.h>
+
 namespace EmuSC { namespace Xp {
 
 class WorkerPool {
@@ -54,6 +56,40 @@ private:
   struct Shared;
   Shared *_shared;
   unsigned _threads;
+};
+
+/* One thread at idle priority that works through a queue of small fixed
+   items, for work that may as well happen early but must not hold up a
+   render: decoding a wave a loaded patch will need before its first note
+   asks for it. Built without EMUSC_RENDER_THREADS there is no thread and
+   every post is dropped, which leaves the work to whoever needs it first.
+   The output never depends on whether an item ran. */
+class BackgroundWorker {
+public:
+  struct Item {
+    uint32_t a, b, c;
+  };
+  typedef void (*Task)(void *context, const Item &item);
+
+  BackgroundWorker(Task task, void *context);
+  ~BackgroundWorker();
+  BackgroundWorker(const BackgroundWorker &) = delete;
+  BackgroundWorker &operator=(const BackgroundWorker &) = delete;
+
+  /* Queues `item`; false, dropping it, when the queue is full or there is
+     no thread. */
+  bool post(const Item &item);
+
+  /* A lock the task and the code that shares its data hold around that
+     data; it does nothing where there is no thread. */
+  void lock();
+  void unlock();
+
+  static const unsigned kQueueItems = 2048;
+
+private:
+  struct Shared;
+  Shared *_shared;
 };
 
 }}  // namespace EmuSC::Xp

@@ -10,6 +10,7 @@
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
+#include <unistd.h>
 #endif
 #if defined(__SSE__)
 #include <xmmintrin.h>
@@ -197,6 +198,106 @@ void WorkerPool::run(unsigned count, Job job, void *context)
     std::this_thread::yield();
 }
 
+
+/* The worker drains a ring of items under the mutex, running each task with
+   it released. It drops to SCHED_IDLE, so it only ever runs on time no
+   render thread wants, and widens its affinity back to every CPU, since it
+   inherits a render thread's pinning from its creator. */
+struct BackgroundWorker::Shared {
+  std::mutex mutex;
+  std::condition_variable wake;
+  std::thread thread;
+  bool quit = false;
+  Task task;
+  void *context;
+  Item ring[kQueueItems];
+  unsigned head = 0;   /* next to run */
+  unsigned count = 0;
+  /* The lock callers share with the task; separate from `mutex` so that
+     posting never waits on a task in progress. */
+  std::mutex data;
+
+  void loop()
+  {
+#if defined(__linux__)
+    sched_param param{};
+    pthread_setschedparam(pthread_self(), SCHED_IDLE, &param);
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    long cpus = sysconf(_SC_NPROCESSORS_CONF);
+    for (long c = 0; c < cpus && c < CPU_SETSIZE; ++c)
+      CPU_SET(c, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+#endif
+    for (;;) {
+      Item item;
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        wake.wait(lock, [&] { return quit || count; });
+        if (quit)
+          return;
+        item = ring[head];
+        head = (head + 1u) % kQueueItems;
+        --count;
+      }
+      task(context, item);
+    }
+  }
+};
+
+BackgroundWorker::BackgroundWorker(Task task, void *context)
+  : _shared(new Shared)
+{
+  _shared->task = task;
+  _shared->context = context;
+  try {
+    _shared->thread = std::thread([s = _shared] { s->loop(); });
+  } catch (...) {
+    delete _shared;
+    _shared = nullptr;
+  }
+}
+
+BackgroundWorker::~BackgroundWorker()
+{
+  if (!_shared)
+    return;
+  {
+    std::lock_guard<std::mutex> lock(_shared->mutex);
+    _shared->quit = true;
+  }
+  _shared->wake.notify_one();
+  _shared->thread.join();
+  delete _shared;
+}
+
+bool BackgroundWorker::post(const Item &item)
+{
+  if (!_shared)
+    return false;
+  {
+    std::lock_guard<std::mutex> lock(_shared->mutex);
+    if (_shared->count == kQueueItems)
+      return false;
+    _shared->ring[(_shared->head + _shared->count) % kQueueItems] = item;
+    ++_shared->count;
+  }
+  _shared->wake.notify_one();
+  return true;
+}
+
+void BackgroundWorker::lock()
+{
+  if (_shared)
+    _shared->data.lock();
+}
+
+void BackgroundWorker::unlock()
+{
+  if (_shared)
+    _shared->data.unlock();
+}
+
 #else
 
 struct WorkerPool::Shared {};
@@ -219,6 +320,31 @@ void WorkerPool::run(unsigned count, Job job, void *context)
 {
   for (unsigned i = 0; i < count; ++i)
     job(context, i);
+}
+
+
+struct BackgroundWorker::Shared {};
+
+BackgroundWorker::BackgroundWorker(Task, void *)
+  : _shared(nullptr)
+{
+}
+
+BackgroundWorker::~BackgroundWorker()
+{
+}
+
+bool BackgroundWorker::post(const Item &)
+{
+  return false;
+}
+
+void BackgroundWorker::lock()
+{
+}
+
+void BackgroundWorker::unlock()
+{
 }
 
 #endif

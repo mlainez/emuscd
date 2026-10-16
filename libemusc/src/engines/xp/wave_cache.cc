@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: CC0-1.0 */
 #include "wave_cache.h"
 
+#include "common/worker_pool.h"
+
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -37,6 +39,35 @@ int32_t *decodeNew(const struct XpDeviceProfile *profile, const uint8_t *bank,
     return nullptr;
   }
   return pcm;
+}
+
+/* Holds the cache's lock for one call, where it has one. */
+struct Guard {
+  EmuSC::Xp::BackgroundWorker *worker;
+  explicit Guard(const struct xp_wave_cache *cache)
+    : worker(cache ? cache->guard : nullptr)
+  {
+    if (worker)
+      worker->lock();
+  }
+  ~Guard()
+  {
+    if (worker)
+      worker->unlock();
+  }
+};
+
+struct xp_wave_cache_entry *findEntry(struct xp_wave_cache *cache,
+                                      const uint8_t *bank, uint32_t first,
+                                      uint32_t last)
+{
+  for (unsigned i = 0; i < XP_WAVE_CACHE_ENTRIES; ++i) {
+    struct xp_wave_cache_entry *entry = cache->entries + i;
+    if (entry->pcm && entry->bank == bank && entry->base == first &&
+        entry->last == last)
+      return entry;
+  }
+  return nullptr;
 }
 
 /* Frees unreferenced entries, least recently used first, until the cache
@@ -80,6 +111,7 @@ bool wave_cache_acquire(struct xp_wave_cache *cache,
     return *pcm != nullptr;
   }
 
+  Guard guard(cache);
   const uint32_t first = desc->address_a & ~UINT32_C(0x0f);
   struct xp_wave_cache_entry *victim = nullptr;
   for (unsigned i = 0; i < XP_WAVE_CACHE_ENTRIES; ++i) {
@@ -139,10 +171,65 @@ bool wave_cache_acquire(struct xp_wave_cache *cache,
   return true;
 }
 
+bool wave_cache_prefetch(struct xp_wave_cache *cache,
+                          const struct XpDeviceProfile *profile,
+                          const uint8_t *bank, size_t bankSize,
+                          const struct xp_wave_descriptor *desc)
+{
+  if (!cache || !decodable(profile, bank, bankSize, desc))
+    return false;
+  const uint32_t first = desc->address_a & ~UINT32_C(0x0f);
+  {
+    Guard guard(cache);
+    if (findEntry(cache, bank, first, desc->address_c))
+      return false;
+  }
+  uint32_t decodedBase;
+  size_t decodedCount;
+  int32_t *fresh = decodeNew(profile, bank, bankSize, desc, &decodedBase,
+                             &decodedCount);
+  if (!fresh)
+    return false;
+  Guard guard(cache);
+  /* A note may have asked for it while it was decoding. */
+  struct xp_wave_cache_entry *victim = nullptr;
+  bool present = findEntry(cache, bank, first, desc->address_c) != nullptr;
+  if (!present) {
+    for (unsigned i = 0; i < XP_WAVE_CACHE_ENTRIES; ++i) {
+      struct xp_wave_cache_entry *entry = cache->entries + i;
+      if (!entry->pcm) {
+        victim = entry;
+        break;
+      }
+      if (entry->refs == 0 &&
+          (!victim || entry->last_use < victim->last_use))
+        victim = entry;
+    }
+  }
+  if (!victim) {
+    std::free(fresh);
+    return false;
+  }
+  if (victim->pcm)
+    cache->bytes -= victim->count * sizeof *victim->pcm;
+  std::free(victim->pcm);
+  cache->bytes += decodedCount * sizeof *fresh;
+  victim->pcm = fresh;
+  victim->bank = bank;
+  victim->base = decodedBase;
+  victim->last = desc->address_c;
+  victim->count = decodedCount;
+  victim->refs = 0;
+  victim->last_use = ++cache->clock;
+  trimToBudget(cache);
+  return true;
+}
+
 void wave_cache_release(struct xp_wave_cache *cache, const int32_t *pcm)
 {
   if (!pcm)
     return;
+  Guard guard(cache);
   if (cache) {
     for (unsigned i = 0; i < XP_WAVE_CACHE_ENTRIES; ++i) {
       struct xp_wave_cache_entry *entry = cache->entries + i;
@@ -163,11 +250,17 @@ void wave_cache_clear(struct xp_wave_cache *cache)
 {
   if (!cache)
     return;
+  EmuSC::Xp::BackgroundWorker *guard = cache->guard;
+  if (guard)
+    guard->lock();
   for (unsigned i = 0; i < XP_WAVE_CACHE_ENTRIES; ++i) {
     assert(cache->entries[i].refs == 0);
     std::free(cache->entries[i].pcm);
   }
   std::memset(cache, 0, sizeof *cache);
+  cache->guard = guard;
+  if (guard)
+    guard->unlock();
 }
 
 }}  // namespace EmuSC::Xp

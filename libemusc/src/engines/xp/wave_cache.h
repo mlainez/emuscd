@@ -9,6 +9,8 @@
 #include <stdint.h>
 
 #ifdef __cplusplus
+namespace EmuSC { namespace Xp { class BackgroundWorker; } }
+
 extern "C" {
 #endif
 
@@ -21,7 +23,7 @@ extern "C" {
    miss with every entry referenced decodes into a private buffer instead
    of growing the table. */
 #define XP_WAVE_CACHE_ENTRIES 512
-#define XP_WAVE_CACHE_BYTES ((size_t)32 << 20)
+#define XP_WAVE_CACHE_BYTES ((size_t)64 << 20)
 
 struct xp_wave_cache_entry {
   /* Null marks an empty entry. */
@@ -45,6 +47,9 @@ struct xp_wave_cache {
   uint64_t clock;
   /* Decoded bytes the entries hold. */
   size_t bytes;
+  /* Where the cache is shared with a prefetching thread, the lock every
+     call here takes; null where one thread owns the cache. Not owned. */
+  EmuSC::Xp::BackgroundWorker *guard;
 };
 
 #ifdef __cplusplus
@@ -54,8 +59,9 @@ namespace EmuSC { namespace Xp {
 
 // Decoded-PCM cache for the XP voice path. FCE decoding is a pure function
 // of the bank's bytes and the decoded extent, so a cached decode is the
-// same samples a fresh one would produce. Not thread-safe: one cache
-// belongs to one renderer and is used from the thread that renders it.
+// same samples a fresh one would produce. One cache belongs to one
+// renderer; a prefetching thread may share it once `guard` is set, and
+// then every call takes guard's lock.
 
 /* Hand out decoded PCM for `desc`, from the cache or freshly decoded.
  * On success `*pcm` holds `*count` samples starting at wave address
@@ -68,6 +74,16 @@ bool wave_cache_acquire(struct xp_wave_cache *cache,
                          const struct xp_wave_descriptor *desc,
                          const int32_t **pcm, uint32_t *base,
                          size_t *count);
+
+/* Decode `desc` into the cache ahead of a note that will need it, as an
+ * unreferenced entry. Decodes outside the lock and takes only an empty
+ * entry or the least recently used unreferenced one, so it never displaces
+ * a sounding voice's PCM. False if it was already cached or could not be
+ * kept; either way the next acquire is answered with the same samples. */
+bool wave_cache_prefetch(struct xp_wave_cache *cache,
+                          const struct XpDeviceProfile *profile,
+                          const uint8_t *bank, size_t bankSize,
+                          const struct xp_wave_descriptor *desc);
 
 /* Give back one reference from wave_cache_acquire. Null is a no-op. */
 void wave_cache_release(struct xp_wave_cache *cache, const int32_t *pcm);
