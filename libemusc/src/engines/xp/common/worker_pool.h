@@ -27,8 +27,12 @@ public:
   /* `threads` counts the caller: a pool of N runs jobs on N - 1 threads of
      its own plus the one that calls run(). 0 asks for one per CPU this
      process may run on. Clamped to what this build supports - always 1
-     without EMUSC_RENDER_THREADS - and to kMaxThreads. */
-  explicit WorkerPool(unsigned threads);
+     without EMUSC_RENDER_THREADS - and to kMaxThreads. Worker i is pinned
+     to workerCpus[i] where one is given, on Linux; the scheduler never
+     moves a thread onto a CPU taken out of balancing (isolcpus), so pinning
+     is the only way a worker gets one. Elsewhere the list is ignored. */
+  explicit WorkerPool(unsigned threads, const unsigned *workerCpus = nullptr,
+                      unsigned workerCpuCount = 0);
   ~WorkerPool();
   WorkerPool(const WorkerPool &) = delete;
   WorkerPool &operator=(const WorkerPool &) = delete;

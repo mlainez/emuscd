@@ -3,11 +3,16 @@
 
 #ifdef EMUSC_RENDER_THREADS
 #include <atomic>
+#include <cfenv>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
 #if defined(__linux__)
+#include <pthread.h>
 #include <sched.h>
+#endif
+#if defined(__SSE__)
+#include <xmmintrin.h>
 #endif
 #endif
 
@@ -33,6 +38,16 @@ struct WorkerPool::Shared {
   std::atomic<unsigned> next{0};
   std::atomic<unsigned> remaining{0};
   std::atomic<unsigned> busy{0};
+  /* The floating-point environment of the thread that built the pool. A job
+     computes on a worker exactly as it would on that thread only if the
+     worker runs under the same rounding and flush-to-zero modes, so each
+     worker takes it over before its first job rather than relying on the
+     OS to have copied it. MXCSR is copied whole: fesetenv need not carry
+     its flush-to-zero bit. */
+  std::fenv_t fenv;
+#if defined(__SSE__)
+  unsigned mxcsr = 0;
+#endif
 
   void work(Job j, void *c, unsigned n)
   {
@@ -47,6 +62,10 @@ struct WorkerPool::Shared {
 
   void loop()
   {
+    std::fesetenv(&fenv);
+#if defined(__SSE__)
+    _mm_setcsr(mxcsr);
+#endif
     unsigned seen = 0;
     for (;;) {
       /* A block's jobs follow each other within microseconds, so a worker
@@ -99,7 +118,8 @@ unsigned WorkerPool::available_cpus()
   return n ? n : 1u;
 }
 
-WorkerPool::WorkerPool(unsigned threads)
+WorkerPool::WorkerPool(unsigned threads, const unsigned *workerCpus,
+                       unsigned workerCpuCount)
   : _shared(nullptr), _threads(1)
 {
   if (!threads)
@@ -109,12 +129,25 @@ WorkerPool::WorkerPool(unsigned threads)
   if (threads <= 1)
     return;
   _shared = new Shared;
+  std::fegetenv(&_shared->fenv);
+#if defined(__SSE__)
+  _shared->mxcsr = _mm_getcsr();
+#endif
   for (unsigned i = 0; i + 1 < threads; ++i) {
     try {
       _shared->workers[i] = std::thread([s = _shared] { s->loop(); });
     } catch (...) {
       break;
     }
+#if defined(__linux__)
+    if (workerCpus && i < workerCpuCount && workerCpus[i] < CPU_SETSIZE) {
+      cpu_set_t set;
+      CPU_ZERO(&set);
+      CPU_SET(workerCpus[i], &set);
+      pthread_setaffinity_np(_shared->workers[i].native_handle(), sizeof set,
+                             &set);
+    }
+#endif
     ++_shared->workerCount;
   }
   _threads = _shared->workerCount + 1u;
@@ -173,7 +206,7 @@ unsigned WorkerPool::available_cpus()
   return 1u;
 }
 
-WorkerPool::WorkerPool(unsigned)
+WorkerPool::WorkerPool(unsigned, const unsigned *, unsigned)
   : _shared(nullptr), _threads(1)
 {
 }

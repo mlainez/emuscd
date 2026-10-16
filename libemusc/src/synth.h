@@ -130,7 +130,10 @@ public:
   // leaves nothing to divide. No effect on the other devices, or in a build
   // without thread support (32-bit Windows), where every count means 1. Not
   // to be called while another thread is rendering.
-  void set_render_threads(unsigned threads);
+  // workerCpus, on Linux, pins the pool's own threads one per listed CPU in
+  // order; the calling thread is the caller's to place.
+  void set_render_threads(unsigned threads,
+                          const std::vector<unsigned> &workerCpus = {});
   // The threads actually in use, which may be fewer than were asked for.
   unsigned render_threads(void) const;
 

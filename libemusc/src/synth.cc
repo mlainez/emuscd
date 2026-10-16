@@ -142,7 +142,8 @@ void Synth::set_max_voices(unsigned maxVoices)
 }
 
 
-void Synth::set_render_threads(unsigned threads)
+void Synth::set_render_threads(unsigned threads,
+                               const std::vector<unsigned> &workerCpus)
 {
   if (_xpDevice)
     Xp::device_set_worker_pool(_xpDevice, nullptr);
@@ -150,7 +151,8 @@ void Synth::set_render_threads(unsigned threads)
   _renderPool = nullptr;
   if (threads == 1)
     return;
-  Xp::WorkerPool *pool = new Xp::WorkerPool(threads);
+  Xp::WorkerPool *pool = new Xp::WorkerPool(
+    threads, workerCpus.data(), (unsigned) workerCpus.size());
   if (pool->threads() <= 1) {
     delete pool;
     return;
