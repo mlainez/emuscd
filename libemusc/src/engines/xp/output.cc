@@ -350,14 +350,18 @@ void output_process(struct xp_output *out, float *stereo, size_t frames)
      output is; none of the three may be reordered for speed. */
   const unsigned taps = out->hold_taps;
   const unsigned last = taps - 1;
+  /* Read through locals: `stereo` is a float pointer too, so the compiler
+     would otherwise reload the taps and the ring after every store to it. */
+  const float *const hold = out->hold;
   for (size_t k = 0; k < frames; ++k) {
     unsigned pos = out->hold_pos;
     for (unsigned ch = 0; ch < 2; ++ch) {
+      float *const z = out->hold_z[ch];
       float acc = 0.0f;
       unsigned idx = pos;
-      out->hold_z[ch][pos] = stereo[k * 2 + ch];
+      z[pos] = stereo[k * 2 + ch];
       for (unsigned t = 0; t < taps; ++t) {
-        acc += out->hold[t] * out->hold_z[ch][idx];
+        acc += hold[t] * z[idx];
         idx = idx ? idx - 1 : last;
       }
       stereo[k * 2 + ch] = acc;
