@@ -10,6 +10,7 @@
 #include <cstring>
 #include <climits>
 #include <cstdlib>
+#include <new>
 
 namespace EmuSC { namespace Xp {
 
@@ -246,7 +247,7 @@ bool tvf_coefficients_init(struct xp_tvf_coefficients *coefficients,
   if (!coefficients)
     return false;
   coefficients->rate = rate;
-  coefficients->g = (float *)std::calloc(XP_TVF_NYQUIST_WORD, sizeof(float));
+  coefficients->g = new (std::nothrow) std::atomic<float>[XP_TVF_NYQUIST_WORD]();
   return coefficients->g != nullptr;
 }
 
@@ -254,7 +255,7 @@ void tvf_coefficients_destroy(struct xp_tvf_coefficients *coefficients)
 {
   if (!coefficients)
     return;
-  std::free(coefficients->g);
+  delete[] coefficients->g;
   coefficients->g = nullptr;
 }
 
@@ -658,10 +659,10 @@ float tvf_audio_process_provisional(void *user, struct xp_tvf_audio_state *state
     } else {
       struct xp_tvf_coefficients *table = (struct xp_tvf_coefficients *)user;
       if (table && table->g && wordInt < XP_TVF_NYQUIST_WORD) {
-        float entry = table->g[wordInt];
+        float entry = table->g[wordInt].load(std::memory_order_relaxed);
         if (entry == 0.0f) {
           entry = (float)coefficientForWord(wordInt, table->rate);
-          table->g[wordInt] = entry;
+          table->g[wordInt].store(entry, std::memory_order_relaxed);
         }
         g = entry;
       } else {
