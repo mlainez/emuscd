@@ -60,6 +60,12 @@ emuscd --device sc88 --name "My Synth"
 --threads N         Threads the SC-88 and JV-1080 render their voices on,
                     this one included; 0 is one per CPU the process may use
                     (default: 0). The audio is the same at every count
+--cpus LIST         Pin the render threads one per CPU in LIST (e.g. 0-3):
+                    this thread on the first, the pool's from the last
+                    down, so a core kept out of scheduling (isolcpus)
+                    still gets one. Without --threads, one per CPU listed
+--stats             Every 5 s on stderr: render time per block as a
+                    share of its playing time (avg, p99, max)
 --gain-db DB        Output gain in dB, linear multiplier 10^(DB/20) applied
                     to the final samples (default: 0, no change - a
                     listening-convenience knob only, see emusc-render's
