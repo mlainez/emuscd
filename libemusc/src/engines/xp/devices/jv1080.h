@@ -381,6 +381,16 @@ bool jv1080_voice_span(const struct xp_rom *rom,
                         const uint8_t *tone, unsigned key, unsigned velocity,
                         int keyShift, size_t *samples);
 
+/* The span jv1080_voice_start decodes for this tone at this key, as the
+ * decoded-PCM cache keys it: the bank, and the first and last wave
+ * addresses. Velocity does not move it. False where no element is
+ * resolved at that key. */
+bool jv1080_voice_decode_span(const struct xp_rom *rom,
+                               const struct XpVoiceFieldMap *fields,
+                               const uint8_t *tone, unsigned key,
+                               int keyShift, unsigned *bank,
+                               uint32_t *first, uint32_t *last);
+
 void jv1080_voice_release(struct XpJv1080Voice *voice);
 /* Link a tone pair under structure `type` (the panel's 2..10): `second`
    renders both from then on, and `first` must no longer be rendered on its

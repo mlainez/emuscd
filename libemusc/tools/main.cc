@@ -13,6 +13,7 @@
 #include "wav.h"
 #include "audio_out.h"
 #include "version.h"
+#include "cpu_list.h"
 #include "mxcsr_ftz.h"
 #include "rom_paths.h"
 #include "gain.h"
@@ -22,6 +23,7 @@
 #include "wave_rom.h"
 
 #include <cctype>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -102,6 +104,17 @@ drive emusc-render and another renderer with the same options):
                          SC-88/JV-1080), trading polyphony for headroom on
                          too slow to sustain the worst case (default: the
                          device's own ceiling - this can only lower it)
+  --threads N            threads the SC-88 and JV-1080 engines render their
+                         voices on, this one included; 0 is one per CPU this
+                         process may use (default: 0). The output is the same
+                         bytes at every count. No effect on the other devices,
+                         or in a build without thread support (32-bit
+                         Windows)
+  --cpus LIST            pin the render threads one per CPU in LIST (e.g.
+                         0-3, Linux only): this one on the first, the
+                         pool's from the last down, so a core kept out of
+                         scheduling (isolcpus) still gets one. Without
+                         --threads, one thread per CPU listed
 
 ROM selection (--device and --rom-dir, both defaulted, or the explicit
 --control-rom/--wave-rom/--cpu-rom files, which bypass both):
@@ -191,6 +204,8 @@ struct Options {
   unsigned latency = 500;
   bool max_voices_set = false;
   unsigned max_voices = 0;
+  unsigned threads = 0;
+  std::vector<unsigned> cpus;
 };
 
 [[noreturn]] void die(int code, const std::string &msg) {
@@ -264,6 +279,11 @@ Options parse_args(int argc, char **argv) {
 #endif
     else if (a == "--block")       o.block = static_cast<unsigned>(std::stoul(need("--block")));
     else if (a == "--latency")     o.latency = static_cast<unsigned>(std::stoul(need("--latency")));
+    else if (a == "--threads")     o.threads = static_cast<unsigned>(std::stoul(need("--threads")));
+    else if (a == "--cpus") {
+      if (!emusc_tools::parse_cpu_list(need("--cpus"), o.cpus))
+        die(1, "--cpus takes a list such as 0-3 or 0,2,3");
+    }
     else if (a == "--max-voices") {
       o.max_voices_set = true;
       o.max_voices = static_cast<unsigned>(std::stoul(need("--max-voices")));
@@ -497,6 +517,14 @@ int main(int argc, char **argv) {
   // LFO. Re-seed with a fixed value so the render is reproducible.
   EmuSC::Synth::seed_random(o.seed);
   if (o.max_voices_set) synth.set_max_voices(o.max_voices);
+  if (o.cpus.empty()) {
+    synth.set_render_threads(o.threads);
+  } else {
+    if (!emusc_tools::pin_this_thread(o.cpus[0]))
+      std::fprintf(stderr, "emusc-render: cannot pin to CPU %u\n", o.cpus[0]);
+    synth.set_render_threads(o.threads ? o.threads : (unsigned) o.cpus.size(),
+                             emusc_tools::worker_cpus(o.cpus));
+  }
   synth.set_audio_format(o.rate, 2);   // also instantiates the 16 parts
 
   // Power-on reset, before the first event is queued. --reset selects the sound
@@ -655,11 +683,24 @@ int main(int argc, char **argv) {
     // byte-identically to a build without this option at all.
     const float gain_lin = emusc_tools::gain_db_to_linear(o.gain_db);
 
+    // Frames are rendered a block at a time; each block's events are queued
+    // before it, still EVENT_LEAD_FRAMES ahead of the block's first frame,
+    // which leaves every event of the block itself queued in time.
+    const uint64_t RENDER_BLOCK_FRAMES = 256;
+    static_assert(RENDER_BLOCK_FRAMES <= EVENT_LEAD_FRAMES,
+                  "a block's own events must be queued before it renders");
+    std::vector<float> rendered(2 * RENDER_BLOCK_FRAMES);
+    // Each block's render time over the time it plays for: the peaks are
+    // what a live engine has to absorb, which the average ratio hides.
+    std::vector<double> block_load;
+    block_load.reserve(total_frames / RENDER_BLOCK_FRAMES + 1);
     size_t next = 0;
-    for (uint64_t fr = 0; fr < total_frames; fr++) {
-      while (next < sched.size() && sched[next].frame <= fr + EVENT_LEAD_FRAMES) {
+    for (uint64_t base = 0; base < total_frames; base += RENDER_BLOCK_FRAMES) {
+      const uint64_t count =
+        std::min<uint64_t>(RENDER_BLOCK_FRAMES, total_frames - base);
+      while (next < sched.size() && sched[next].frame <= base + EVENT_LEAD_FRAMES) {
         const smf::Event &e = *sched[next].ev;
-        const uint32_t off = static_cast<uint32_t>(sched[next].frame - fr);
+        const uint32_t off = static_cast<uint32_t>(sched[next].frame - base);
         if (e.kind == smf::Kind::Channel) {
           const uint8_t port =
             (e.track >= 0 && (size_t) e.track < trackPort.size())
@@ -678,59 +719,65 @@ int main(int argc, char **argv) {
         }
         next++;
       }
-      float l = 0.0f, r = 0.0f;
-      synth.get_next_frame(l, r);
-      emusc_tools::apply_gain(l, r, gain_lin);
-      // Float output has no quantization step of its own to clamp it, so a
-      // requested gain that pushes a sample past +-1.0 is clamped here
-      // explicitly; skipped along with apply_gain() itself when no gain was
-      // requested, so a default render's float samples are never touched.
-      if (o.gain_db != 0.0 && o.as_float) {
-        if (l > 1.0f) l = 1.0f; else if (l < -1.0f) l = -1.0f;
-        if (r > 1.0f) r = 1.0f; else if (r < -1.0f) r = -1.0f;
-      }
-      for (float v : {l, r})
-        if (std::fabs(v) >= kFullScale) {
-          if (!full_scale++) first_full_scale = fr;
-          last_full_scale = fr;
+      const auto block_begin = clock::now();
+      synth.get_next_frames(rendered.data(), count);
+      block_load.push_back(
+        std::chrono::duration<double>(clock::now() - block_begin).count() *
+        o.rate / (double) count);
+      for (uint64_t fr = base; fr < base + count; fr++) {
+        float l = rendered[2 * (fr - base)], r = rendered[2 * (fr - base) + 1];
+        emusc_tools::apply_gain(l, r, gain_lin);
+        // Float output has no quantization step of its own to clamp it, so a
+        // requested gain that pushes a sample past +-1.0 is clamped here
+        // explicitly; skipped along with apply_gain() itself when no gain was
+        // requested, so a default render's float samples are never touched.
+        if (o.gain_db != 0.0 && o.as_float) {
+          if (l > 1.0f) l = 1.0f; else if (l < -1.0f) l = -1.0f;
+          if (r > 1.0f) r = 1.0f; else if (r < -1.0f) r = -1.0f;
         }
-      if (wav) {
-        if (o.as_float) {
-          fbuf.push_back(l);
-          fbuf.push_back(r);
-          if (fbuf.size() >= 2 * 4096) { wav->write(fbuf.data(), fbuf.size() / 2); fbuf.clear(); }
-        } else {
-          buf.push_back(to_i16(l));
-          buf.push_back(to_i16(r));
-          if (buf.size() >= 2 * 4096) { wav->write(buf.data(), buf.size() / 2); buf.clear(); }
+        for (float v : {l, r})
+          if (std::fabs(v) >= kFullScale) {
+            if (!full_scale++) first_full_scale = fr;
+            last_full_scale = fr;
+          }
+        if (wav) {
+          if (o.as_float) {
+            fbuf.push_back(l);
+            fbuf.push_back(r);
+            if (fbuf.size() >= 2 * 4096) { wav->write(fbuf.data(), fbuf.size() / 2); fbuf.clear(); }
+          } else {
+            buf.push_back(to_i16(l));
+            buf.push_back(to_i16(r));
+            if (buf.size() >= 2 * 4096) { wav->write(buf.data(), buf.size() / 2); buf.clear(); }
+          }
         }
-      }
-      if (audio_out) {
-        play_buf.push_back(to_i16(l));
-        play_buf.push_back(to_i16(r));
-        if (play_buf.size() >= 2 * (size_t) o.block) {
-          const auto compute_end = clock::now();
-          window_busy += compute_end - block_start;
-          overall_busy += compute_end - block_start;
+        if (audio_out) {
+          play_buf.push_back(to_i16(l));
+          play_buf.push_back(to_i16(r));
+          if (play_buf.size() >= 2 * (size_t) o.block) {
+            const auto compute_end = clock::now();
+            window_busy += compute_end - block_start;
+            overall_busy += compute_end - block_start;
 
-          audio_out->write(play_buf.data(), play_buf.size() / 2);
-          play_buf.clear();
+            audio_out->write(play_buf.data(), play_buf.size() / 2);
+            play_buf.clear();
 
-          const auto now = clock::now();
-          block_start = now;
-          if (now - window_start >= std::chrono::seconds(2)) {
-            using secs = std::chrono::duration<double>;
-            const double window_pct = 100.0 * secs(window_busy).count() /
-                                      secs(now - window_start).count();
-            const double overall_pct = 100.0 * secs(overall_busy).count() /
-                                       secs(now - render_start).count();
-            std::fprintf(stderr,
-                         "emusc-render: --play: CPU busy %.0f%% of wall "
-                         "time (window), %.0f%% (overall); lower = more "
-                         "headroom\n",
-                         window_pct, overall_pct);
-            window_start = now;
-            window_busy = clock::duration{};
+            const auto now = clock::now();
+            block_start = now;
+            if (now - window_start >= std::chrono::seconds(2)) {
+              using secs = std::chrono::duration<double>;
+              const double window_pct = 100.0 * secs(window_busy).count() /
+                                        secs(now - window_start).count();
+              const double overall_pct = 100.0 * secs(overall_busy).count() /
+                                         secs(now - render_start).count();
+              std::fprintf(stderr,
+                           "emusc-render: --play: CPU busy %.0f%% of wall "
+                           "time (window), %.0f%% (overall); lower = more "
+                           "headroom\n",
+                           window_pct, overall_pct);
+              window_start = now;
+              window_busy = clock::duration{};
+            }
           }
         }
       }
@@ -762,6 +809,20 @@ int main(int argc, char **argv) {
                      (unsigned long long) wav->frames(), o.out.c_str(),
                      render_wall, audio_seconds / render_wall,
                      synth.get_num_clipped_samples(false));
+        if (!block_load.empty()) {
+          std::vector<double> sorted = block_load;
+          std::sort(sorted.begin(), sorted.end());
+          size_t over = 0;
+          for (double l : sorted) over += l > 1.0;
+          std::fprintf(stderr,
+                       "emusc-render: per %llu-frame block, render time over "
+                       "playing time: p50 %.0f%%, p99 %.0f%%, max %.0f%%; "
+                       "%zu of %zu blocks over 100%%\n",
+                       (unsigned long long) RENDER_BLOCK_FRAMES,
+                       100.0 * sorted[sorted.size() / 2],
+                       100.0 * sorted[(sorted.size() * 99) / 100],
+                       100.0 * sorted.back(), over, sorted.size());
+        }
       }
     }
     if (full_scale)

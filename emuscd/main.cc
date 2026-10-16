@@ -2,8 +2,11 @@
 // Listens for MIDI input and synthesizes audio to ALSA output
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <iostream>
 #include <string>
+#include <cerrno>
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
@@ -13,10 +16,14 @@
 #include <mutex>
 #include <vector>
 #include <alsa/asoundlib.h>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/mman.h>
 #include "common.h"
 #include "../libemusc/src/synth.h"
 #include "../libemusc/src/control_rom.h"
 #include "../libemusc/src/wave_rom.h"
+#include "../libemusc/tools/cpu_list.h"
 #include "../libemusc/tools/mxcsr_ftz.h"
 
 using namespace emuscd;
@@ -51,12 +58,49 @@ void list_pcm_devices() {
 
 }  // namespace
 
+// Render time per block against the time the block takes to play, reported
+// every five seconds: the headroom the engine actually has. CPU figures read
+// from /proc overstate it, since the render pool's idle threads spin briefly
+// before they sleep.
+class RenderStats {
+  std::vector<double> loads;   // render time / block period
+  std::chrono::steady_clock::time_point window =
+    std::chrono::steady_clock::now();
+
+public:
+  void add(double load) { loads.push_back(load); }
+
+  void report_if_due(double period_ms) {
+    auto now = std::chrono::steady_clock::now();
+    if (now - window < std::chrono::seconds(5) || loads.empty()) return;
+    std::sort(loads.begin(), loads.end());
+    double sum = 0.0;
+    size_t over = 0;
+    for (double l : loads) {
+      sum += l;
+      if (l > 1.0) over++;
+    }
+    size_t p99 = (loads.size() * 99) / 100;
+    if (p99 >= loads.size()) p99 = loads.size() - 1;
+    std::fprintf(stderr,
+                 "emuscd: %zu blocks of %.1f ms: render avg %.0f%%, p99 "
+                 "%.0f%%, max %.0f%% of the block; %zu over 100%%\n",
+                 loads.size(), period_ms, 100.0 * sum / loads.size(),
+                 100.0 * loads[p99], 100.0 * loads.back(), over);
+    loads.clear();
+    window = now;
+  }
+};
+
 class EmuscdDaemon {
   snd_seq_t* seq = nullptr;
   int seq_port = -1;
   snd_pcm_t* pcm_out = nullptr;
   unsigned int sample_rate;
   unsigned int block_frames;
+  unsigned int render_threads;
+  std::vector<unsigned> worker_cpus;
+  bool show_stats;
   float gain_lin;
 
   std::unique_ptr<EmuSC::ControlRom> ctrl_rom;
@@ -74,8 +118,11 @@ public:
   EmuscdDaemon(const std::string& dev, const std::string& port_name,
                const std::string& pcm_device, const std::string& rom_directory,
                unsigned int requested_rate, unsigned int latency_ms,
-               unsigned int block, double gain_db)
+               unsigned int block, unsigned int threads,
+               const std::vector<unsigned>& workers, bool stats,
+               double gain_db)
       : sample_rate(requested_rate), block_frames(block),
+        render_threads(threads), worker_cpus(workers), show_stats(stats),
         gain_lin(gain_db_to_linear(gain_db)), rom_dir(rom_directory) {
     init_alsa_midi(port_name);
     init_alsa_audio(pcm_device, latency_ms);
@@ -174,6 +221,7 @@ public:
     std::unique_ptr<EmuSC::Synth> new_synth(
       new EmuSC::Synth(*new_ctrl, *new_wave, SOUND_MAP));
     new_synth->set_audio_format(sample_rate, 2);
+    new_synth->set_render_threads(render_threads, worker_cpus);
 
     // Power-on reset, which is what the hardware does when it is switched on
     // and what a GS reset in the stream asks for later. It must follow
@@ -210,8 +258,10 @@ public:
   void run() {
     std::thread stdin_thread([this]() { read_stdin_commands(); });
 
-    std::vector<int16_t> out_buf;
-    out_buf.reserve(block_frames * 2);
+    std::vector<int16_t> out_buf(block_frames * 2);
+    std::vector<float> rendered(block_frames * 2);
+    RenderStats stats;
+    const double period_s = (double) block_frames / sample_rate;
     std::cout << "emuscd daemon running (device: " << device_name << "). "
               << "Type a device name to switch, or 'quit' to exit."
               << std::endl;
@@ -231,16 +281,24 @@ public:
         if (synth) handle_seq_event(ev);
       }
 
+      // A whole block per pass: the MIDI that arrived while the previous one
+      // was written is applied at its start.
       if (synth && pcm_out) {
-        float left = 0.0f, right = 0.0f;
-        synth->get_next_frame(left, right);
-        apply_gain(left, right, gain_lin);
-        out_buf.push_back(to_i16(left));
-        out_buf.push_back(to_i16(right));
-        if (out_buf.size() >= block_frames * 2) {
-          write_block(out_buf);
-          out_buf.clear();
+        auto start = std::chrono::steady_clock::now();
+        synth->get_next_frames(rendered.data(), block_frames);
+        if (show_stats) {
+          std::chrono::duration<double> took =
+            std::chrono::steady_clock::now() - start;
+          stats.add(took.count() / period_s);
+          stats.report_if_due(1000.0 * period_s);
         }
+        for (unsigned int i = 0; i < block_frames; i++) {
+          float left = rendered[i * 2], right = rendered[i * 2 + 1];
+          apply_gain(left, right, gain_lin);
+          out_buf[i * 2] = to_i16(left);
+          out_buf[i * 2 + 1] = to_i16(right);
+        }
+        write_block(out_buf);
       } else {
         std::this_thread::yield();
       }
@@ -343,6 +401,10 @@ int main(int argc, char* argv[]) {
   unsigned int rate = 48000;
   unsigned int latency_ms = 20;
   unsigned int block = 256;
+  unsigned int threads = 0;
+  std::vector<unsigned> cpus;
+  bool stats = false;
+  int rt_priority = 0;
   double gain_db = 0.0;
 
   for (int i = 1; i < argc; i++) {
@@ -375,6 +437,22 @@ int main(int argc, char* argv[]) {
         std::cerr << "emuscd: --block must be >= 1" << std::endl;
         return 1;
       }
+    } else if (arg == "--threads") {
+      threads = static_cast<unsigned int>(std::stoul(need("--threads")));
+    } else if (arg == "--cpus") {
+      if (!emusc_tools::parse_cpu_list(need("--cpus"), cpus)) {
+        std::cerr << "emuscd: --cpus takes a list such as 0-3 or 0,2,3"
+                  << std::endl;
+        return 1;
+      }
+    } else if (arg == "--stats") {
+      stats = true;
+    } else if (arg == "--rt") {
+      rt_priority = std::stoi(need("--rt"));
+      if (rt_priority < 1 || rt_priority > 99) {
+        std::cerr << "emuscd: --rt takes a priority from 1 to 99" << std::endl;
+        return 1;
+      }
     } else if (arg == "--gain-db") {
       gain_db = std::stod(need("--gain-db"));
     } else if (arg == "--help" || arg == "-h") {
@@ -393,6 +471,21 @@ int main(int argc, char* argv[]) {
           << "  --rate HZ           Requested audio sample rate (default: 48000)\n"
           << "  --latency MS        Requested output buffer size (default: 20)\n"
           << "  --block N           Audio frames per ALSA write (default: 256)\n"
+          << "  --threads N         Threads the SC-88 and JV-1080 render their voices\n"
+          << "                       on, this one included; 0 is one per CPU this\n"
+          << "                       process may use (default: 0). The audio is the\n"
+          << "                       same at every count\n"
+          << "  --cpus LIST         Pin the render threads, one per CPU in LIST\n"
+          << "                       (e.g. 0-3): this thread on the first, the\n"
+          << "                       pool's from the last down, so a core kept\n"
+          << "                       out of scheduling (isolcpus) still gets one.\n"
+          << "                       Without --threads, one thread per CPU listed\n"
+          << "  --stats             Every 5 s on stderr: render time per block as\n"
+          << "                       a share of its playing time (avg, p99, max)\n"
+          << "  --rt PRIO           Run the render threads SCHED_FIFO at PRIO (1-99)\n"
+          << "                       with memory locked, so a block's render is not\n"
+          << "                       preempted by ordinary processes or page faults.\n"
+          << "                       Needs CAP_SYS_NICE (root)\n"
           << "  --gain-db DB        Output gain in dB, linear multiplier 10^(DB/20)\n"
           << "                       applied to the final samples (default: 0, no\n"
           << "                       change - a listening-convenience knob only)\n"
@@ -416,9 +509,34 @@ int main(int argc, char* argv[]) {
 
   if (rom_dir.empty()) rom_dir = default_rom_dir();
 
+  // The first CPU listed takes this thread, which renders and also drives
+  // ALSA; the pool's threads take the rest from the last down.
+  std::vector<unsigned> worker_cpus;
+  if (!cpus.empty()) {
+    if (threads == 0) threads = (unsigned) cpus.size();
+    worker_cpus = emusc_tools::worker_cpus(cpus);
+    if (!emusc_tools::pin_this_thread(cpus[0]))
+      std::cerr << "emuscd: cannot pin to CPU " << cpus[0] << std::endl;
+  }
+
+  // Before the synth exists, so that the render pool's threads, created
+  // with it, inherit the policy: glibc's threads take their creator's.
+  if (rt_priority) {
+    sched_param param{};
+    param.sched_priority = rt_priority;
+    int err = pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+    if (err != 0)
+      std::cerr << "emuscd: cannot set SCHED_FIFO " << rt_priority << ": "
+                << std::strerror(err) << std::endl;
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
+      std::cerr << "emuscd: cannot lock memory: " << std::strerror(errno)
+                << std::endl;
+  }
+
   try {
     EmuscdDaemon daemon(device, port_name, pcm_device, rom_dir, rate,
-                         latency_ms, block, gain_db);
+                         latency_ms, block, threads, worker_cpus, stats,
+                         gain_db);
     daemon.run();
   } catch (const std::exception& e) {
     std::cerr << "Fatal error: " << e.what() << std::endl;

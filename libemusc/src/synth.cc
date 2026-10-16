@@ -21,6 +21,7 @@
 #include "engines/gp/part.h"
 #include "engines/gp/random.h"
 #include "engines/xp/device.h"
+#include "engines/xp/common/worker_pool.h"
 #include "settings.h"
 
 #include <cstring>
@@ -125,6 +126,8 @@ bool Synth::_xp_configure(uint32_t sampleRate)
   }
   if (_maxVoicesSet)
     Xp::device_set_max_voices(_xpDevice, _maxVoices);
+  if (_renderPool)
+    Xp::device_set_worker_pool(_xpDevice, _renderPool);
 
   return true;
 }
@@ -139,6 +142,35 @@ void Synth::set_max_voices(unsigned maxVoices)
 }
 
 
+void Synth::set_render_threads(unsigned threads,
+                               const std::vector<unsigned> &workerCpus)
+{
+  if (_xpDevice)
+    Xp::device_set_worker_pool(_xpDevice, nullptr);
+  delete _renderPool;
+  _renderPool = nullptr;
+  if (threads == 1)
+    return;
+  Xp::WorkerPool *pool = new Xp::WorkerPool(
+    threads, workerCpus.data(), (unsigned) workerCpus.size());
+  if (pool->threads() <= 1) {
+    delete pool;
+    return;
+  }
+  _renderPool = pool;
+  if (_xpDevice && !Xp::device_set_worker_pool(_xpDevice, _renderPool)) {
+    delete _renderPool;
+    _renderPool = nullptr;
+  }
+}
+
+
+unsigned Synth::render_threads(void) const
+{
+  return _renderPool ? _renderPool->threads() : 1u;
+}
+
+
 Synth::~Synth()
 {
   if (_xpDevice) {
@@ -146,6 +178,7 @@ Synth::~Synth()
     delete _xpDevice;
     _xpDevice = nullptr;
   }
+  delete _renderPool;
 
   _parts.clear();
   delete _settings;
@@ -957,6 +990,52 @@ int Synth::get_next_frame(float &lOut, float &rOut)
   _hostSampleBufRIndex++;
   _framesDelivered++;
 
+  return 0;
+}
+
+
+int Synth::get_next_frames(float *out, size_t frames)
+{
+  if (!_xpDevice || _sampleRate == 0) {
+    for (size_t f = 0; f < frames; f++)
+      get_next_frame(out[f * 2], out[f * 2 + 1]);
+    return 0;
+  }
+
+  size_t done = 0;
+  while (done < frames) {
+    midiMutex.lock();
+
+    // As get_next_frame() does, everything whose frame has come; then a run
+    // up to the frame the next queued event acts on, which is the first
+    // frame at which get_next_frame() would have done anything but render.
+    while (!_eventQueue.empty() &&
+           _eventQueue.front().applyAt <= _framesDelivered) {
+      PendingEvent &e = _eventQueue.front();
+      if (e.isSysEx)
+        Xp::device_sysex(_xpDevice, e.port, e.sysex.data(), e.sysex.size());
+      else
+        Xp::device_midi(_xpDevice, e.port, e.status, e.data1, e.data2);
+      _eventQueue.pop_front();
+    }
+    size_t run = frames - done;
+    if (!_eventQueue.empty() &&
+        _eventQueue.front().applyAt - _framesDelivered < run)
+      run = (size_t) (_eventQueue.front().applyAt - _framesDelivered);
+
+    float *block = out + done * 2;
+    std::fill(block, block + run * 2, 0.0f);
+    Xp::device_render(_xpDevice, block, run);
+    midiMutex.unlock();
+
+    for (size_t i = 0; i < run * 2; i++) {
+      if (block[i] > 1.0f || block[i] < -1.0f)
+        _numClippedSamples.fetch_add(1, std::memory_order_relaxed);
+      block[i] = std::clamp(block[i], -1.0f, 1.0f);
+    }
+    _framesDelivered += run;
+    done += run;
+  }
   return 0;
 }
 

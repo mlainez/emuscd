@@ -9,6 +9,8 @@
 #include <stdint.h>
 
 #ifdef __cplusplus
+#include <atomic>
+
 extern "C" {
 #endif
 
@@ -204,10 +206,16 @@ double tvf_word_to_hz(uint32_t word);
  * computed by the same code as an uncached coefficient the first time any
  * voice asks for it and read back from then on - the same value, not an
  * approximation of it. 0 marks an entry not yet computed; no word yields a
- * g of 0. One table per Device, since the rate is fixed per Device. */
+ * g of 0. One table per Device, since the rate is fixed per Device.
+ *
+ * Voices on different render threads read and fill it at once. An entry's
+ * value depends on nothing but its word and the rate, so two threads that
+ * both find it empty compute and store the same float; the entries are
+ * atomic, with relaxed ordering, only so that neither read nor write can
+ * tear - a plain load or store of an aligned float on every target. */
 struct xp_tvf_coefficients {
   double rate;
-  float *g;
+  std::atomic<float> *g;
 };
 
 /* Allocates the XP_TVF_NYQUIST_WORD-entry table (1 MiB). */

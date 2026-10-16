@@ -2206,6 +2206,23 @@ bool jv1080_voice_span(const struct xp_rom *rom,
   return true;
 }
 
+bool jv1080_voice_decode_span(const struct xp_rom *rom,
+                               const struct XpVoiceFieldMap *fields,
+                               const uint8_t *tone, unsigned key,
+                               int keyShift, unsigned *bank,
+                               uint32_t *first, uint32_t *last)
+{
+  struct xp_wave_element element;
+  if (!rom || !fields || !tone || !bank || !first || !last || key > 127u ||
+      !resolve_element(rom, fields, tone, key, keyShift, &element) ||
+      element.bank >= XP_WAVE_BANK_COUNT)
+    return false;
+  *bank = element.bank;
+  *first = element.bank_start;
+  *last = element.bank_end;
+  return true;
+}
+
 bool jv1080_patch_tone(const struct xp_rom *rom,
                         const struct xp_packed_record *patch, unsigned index,
                         uint8_t *tone, unsigned *patchLevel,
@@ -3064,9 +3081,22 @@ bool voice_wave(struct XpJv1080Voice *voice, double *out)
      which is [1/6, 2/3, 1/6, 0] at fraction 0 - a smoother, not an
      identity - and sums to one at every fraction. */
   v0 = (double)voice->pcm[i0];
-  v1 = wave_tap(voice, i0, 1, v0);
-  vBack = wave_tap(voice, i0, -1, v0);
-  vFwd = wave_tap(voice, i0, 2, v1);
+  /* Clear of both ends of the data and of the loop's seam, every tap is
+     the plain sample wave_tap would read there - the common case, taken
+     without its wrap and turn tests. */
+  const bool seam = voice->loop_last >= voice->loop_first &&
+    (voice->ping_pong || voice->looping);
+  if (i0 >= 1u && i0 + 2u < voice->pcm_count &&
+      (!seam || (i0 + 2u <= voice->loop_last &&
+                 (voice->ping_pong || i0 != voice->loop_first)))) {
+    v1 = (double)voice->pcm[i0 + 1u];
+    vBack = (double)voice->pcm[i0 - 1u];
+    vFwd = (double)voice->pcm[i0 + 2u];
+  } else {
+    v1 = wave_tap(voice, i0, 1, v0);
+    vBack = wave_tap(voice, i0, -1, v0);
+    vFwd = wave_tap(voice, i0, 2, v1);
+  }
   }
   double rest = 1.0 - frac;
   double sample = (rest * rest * rest / 6.0 * vBack +

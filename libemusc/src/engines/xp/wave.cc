@@ -102,6 +102,17 @@ bool wave_descramble_chip(const struct XpDeviceProfile *profile,
   if (descramble_address(profile, units - 1u) >= units)
     return false;                /* the permutation escapes the chip */
 
+  /* A line permutation moves each bit on its own, so it is the OR of what
+     it does to each byte of its input taken alone: four 256-entry tables
+     per permutation, built by the functions above, give the same word as
+     walking every line of every unit. */
+  uint32_t addressBytes[4][256], dataBytes[4][256];
+  for (unsigned k = 0; k < 4u; ++k)
+    for (uint32_t v = 0; v < 256u; ++v) {
+      addressBytes[k][v] = descramble_address(profile, v << (8u * k));
+      dataBytes[k][v] = descramble_data(profile, v << (8u * k));
+    }
+
   for (uint32_t source = 0; source < units; ++source) {
     const uint32_t byteAddress = source * unit;
     /* The plaintext headers pass through untouched, at their own address
@@ -113,9 +124,12 @@ bool wave_descramble_chip(const struct XpDeviceProfile *profile,
     }
     uint32_t value = 0;
     for (unsigned b = 0; b < unit; ++b)
-      value |= (uint32_t)raw[byteAddress + b] << (8u * b);
-    value = descramble_data(profile, value);
-    const uint32_t target = descramble_address(profile, source) * unit;
+      value |= dataBytes[b][raw[byteAddress + b]];
+    const uint32_t target =
+      (addressBytes[0][source & 0xffu] |
+       addressBytes[1][(source >> 8) & 0xffu] |
+       addressBytes[2][(source >> 16) & 0xffu] |
+       addressBytes[3][source >> 24]) * unit;
     for (unsigned b = 0; b < unit; ++b)
       decoded[target + b] = (uint8_t)(value >> (8u * b));
   }

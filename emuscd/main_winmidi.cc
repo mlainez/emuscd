@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <algorithm>
 #include <vector>
 
 #include "audio_out_dsound.h"
@@ -314,9 +315,13 @@ private:
 
   void render_frames(int16_t *dst, unsigned frames) {
     const Clock::time_point start = Clock::now();
+    if (_rendered.size() < frames * 2) _rendered.resize(frames * 2);
+    if (_synth)
+      _synth->get_next_frames(_rendered.data(), frames);
+    else
+      std::fill(_rendered.begin(), _rendered.begin() + frames * 2, 0.0f);
     for (unsigned i = 0; i < frames; i++) {
-      float l = 0.0f, r = 0.0f;
-      if (_synth) _synth->get_next_frame(l, r);
+      float l = _rendered[i * 2], r = _rendered[i * 2 + 1];
       apply_gain(l, r, _gainLin);
       dst[i * 2]     = to_i16(l);
       dst[i * 2 + 1] = to_i16(r);
@@ -451,6 +456,7 @@ private:
   unsigned _sampleRate, _blockFrames;
   std::string _romDir;
   float _gainLin = 1.0f;
+  std::vector<float> _rendered;
   std::atomic<bool> _running{false};
 
   Clock::duration _renderBusy{};
