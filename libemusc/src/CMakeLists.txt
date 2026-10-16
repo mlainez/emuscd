@@ -2,6 +2,18 @@ cmake_minimum_required(VERSION 3.8...3.30)
 
 configure_file(config.h.in config.h)
 
+# Only worker_pool.cc reads EMUSC_RENDER_THREADS, and the pool's class layout
+# does not depend on it, so it is set on that one file rather than carried by
+# every target that compiles it. Every target this directory builds links the
+# thread library, since every XP target compiles the pool.
+if(EMUSC_RENDER_THREADS)
+  set(THREADS_PREFER_PTHREAD_FLAG ON)
+  find_package(Threads REQUIRED)
+  set_source_files_properties(engines/xp/common/worker_pool.cc PROPERTIES
+    COMPILE_DEFINITIONS EMUSC_RENDER_THREADS=1)
+  link_libraries(Threads::Threads)
+endif()
+
 set(EMUSC_SOURCES
   control_rom.cc
   control_rom.h
@@ -122,7 +134,9 @@ set(EMUSC_SOURCES
   engines/xp/wave.cc
   engines/xp/wave.h
   engines/xp/wave_cache.cc
-  engines/xp/wave_cache.h)
+  engines/xp/wave_cache.h
+  engines/xp/common/worker_pool.cc
+  engines/xp/common/worker_pool.h)
 
 # A plain OBJECT library, not folded into EMUSC_SOURCES: a static archive
 # only pulls in a member when something already needs one of its symbols at
@@ -150,6 +164,9 @@ target_compile_features(emusc_static PRIVATE c_std_99)
 # below build the same .cc files directly.
 target_link_libraries(emusc PRIVATE emusc_dsp_tier)
 target_link_libraries(emusc_static PRIVATE emusc_dsp_tier)
+if(EMUSC_RENDER_THREADS)
+  target_link_libraries(emusc_static PUBLIC Threads::Threads)
+endif()
 
 target_include_directories(emusc PUBLIC "${CMAKE_CURRENT_BINARY_DIR}")
 target_include_directories(emusc_static PUBLIC "${CMAKE_CURRENT_BINARY_DIR}")
@@ -195,7 +212,8 @@ set(XP_JV1080_SOURCES
   engines/xp/spectrum.cc
   engines/xp/stereo_eq.cc
   engines/xp/wave.cc
-  engines/xp/wave_cache.cc)
+  engines/xp/wave_cache.cc
+  engines/xp/common/worker_pool.cc)
 
 # XP-engine specific debug/analysis tools. Distinct from the multi-device
 # emusc-render in libemusc/tools/: that one renders through EmuSC::Synth's
@@ -271,6 +289,7 @@ if(BUILD_TESTING)
   xp_test(xp_delay_test ${XP_JV1080_SOURCES} engines/xp/devices/sc88.cc engines/xp/delay.cc engines/xp/reverb.cc engines/xp/rom.cc)
   xp_test(xp_eq_test ${XP_JV1080_SOURCES} engines/xp/devices/sc88.cc engines/xp/eq.cc engines/xp/rom.cc)
   xp_test(xp_output_test engines/xp/output.cc)
+  xp_test(xp_worker_pool_test engines/xp/common/worker_pool.cc)
 
   add_executable(gp_random_test ../tests/gp_random_test.cc engines/gp/random.cc)
   target_include_directories(gp_random_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

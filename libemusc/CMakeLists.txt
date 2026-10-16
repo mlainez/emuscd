@@ -41,6 +41,22 @@ if(EMUSC_LEGACY_DSP_FAST)
 endif()
 message(STATUS "libEmuSC legacy-fast DSP tier: ${EMUSC_LEGACY_DSP_FAST}")
 
+# Whether the XP engines may spread their voices across threads
+# (Synth::set_render_threads). Off on Windows: the 32-bit build's floor is
+# Windows 98, which has none of the OS calls std::thread links against (see
+# simple_mutex.h), and the multi-core targets this exists for are Linux ARM
+# boards. Off, every thread count renders on the calling thread. Either way
+# the output is the same bytes.
+if(WIN32)
+  set(EMUSC_RENDER_THREADS_DEFAULT OFF)
+else()
+  set(EMUSC_RENDER_THREADS_DEFAULT ON)
+endif()
+option(EMUSC_RENDER_THREADS
+  "Let the XP engines render their voices on several threads"
+  ${EMUSC_RENDER_THREADS_DEFAULT})
+message(STATUS "libEmuSC render threads: ${EMUSC_RENDER_THREADS}")
+
 add_subdirectory(src)
 add_subdirectory(tools)
 
