@@ -136,6 +136,9 @@ Retain only changes whose benefit survives repeated runs.
 
 ## Multi-core (out of scope here, but measured and worth its own plan)
 
+Done for the XP engines; see `xp-block-and-threads-2026-10-16.md`. The text
+below is the measurement that motivated it.
+
 Real hardware measurement on a Raspberry Pi 2 v1.1 (4x Cortex-A7 @ 900 MHz),
 recorded in `rpi2-headroom-2026-09-25.md`: both `emuscd` and `emusc-render`
 are single-threaded (`Threads: 1` for the whole process lifetime, confirmed
