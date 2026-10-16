@@ -39,6 +39,26 @@ int32_t *decodeNew(const struct XpDeviceProfile *profile, const uint8_t *bank,
   return pcm;
 }
 
+/* Frees unreferenced entries, least recently used first, until the cache
+   is within its byte budget or nothing unreferenced is left. */
+void trimToBudget(struct xp_wave_cache *cache)
+{
+  while (cache->bytes > XP_WAVE_CACHE_BYTES) {
+    struct xp_wave_cache_entry *oldest = nullptr;
+    for (unsigned i = 0; i < XP_WAVE_CACHE_ENTRIES; ++i) {
+      struct xp_wave_cache_entry *entry = cache->entries + i;
+      if (entry->pcm && entry->refs == 0 &&
+          (!oldest || entry->last_use < oldest->last_use))
+        oldest = entry;
+    }
+    if (!oldest)
+      return;
+    cache->bytes -= oldest->count * sizeof *oldest->pcm;
+    std::free(oldest->pcm);
+    std::memset(oldest, 0, sizeof *oldest);
+  }
+}
+
 }  // namespace
 
 bool wave_cache_acquire(struct xp_wave_cache *cache,
@@ -97,7 +117,10 @@ bool wave_cache_acquire(struct xp_wave_cache *cache,
     return false;
   if (victim) {
     assert(victim->refs == 0);
+    if (victim->pcm)
+      cache->bytes -= victim->count * sizeof *victim->pcm;
     std::free(victim->pcm);
+    cache->bytes += decodedCount * sizeof *fresh;
     victim->pcm = fresh;
     victim->bank = bank;
     victim->base = decodedBase;
@@ -105,6 +128,7 @@ bool wave_cache_acquire(struct xp_wave_cache *cache,
     victim->count = decodedCount;
     victim->refs = 1;
     victim->last_use = ++cache->clock;
+    trimToBudget(cache);
   }
   /* With no victim every entry is referenced: `fresh` stays private to
      this caller and wave_cache_release frees it, since no entry holds
@@ -126,6 +150,8 @@ void wave_cache_release(struct xp_wave_cache *cache, const int32_t *pcm)
         assert(entry->refs > 0);
         if (entry->refs > 0)
           --entry->refs;
+        if (entry->refs == 0)
+          trimToBudget(cache);
         return;
       }
     }

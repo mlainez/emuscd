@@ -12,11 +12,16 @@
 extern "C" {
 #endif
 
-/* Bounded by entry count, not by bytes: a dense passage rarely has more
-   distinct hot samples than this, and a referenced entry is never
-   displaced, so a miss with every entry referenced decodes into a private
-   buffer instead of growing the table. */
-#define XP_WAVE_CACHE_ENTRIES 32
+/* Bounded by entry count and by bytes. A song plays a few hundred distinct
+   waves - the JV-1080's first factory song 190 - and a decode evicted
+   between two of its notes is decoded again on the next, inside the block
+   that note starts in, so the table holds a whole song's worth. The byte
+   budget bounds what that keeps resident: past it, unreferenced entries go,
+   least recently used first. A referenced entry is never displaced, so a
+   miss with every entry referenced decodes into a private buffer instead
+   of growing the table. */
+#define XP_WAVE_CACHE_ENTRIES 512
+#define XP_WAVE_CACHE_BYTES ((size_t)32 << 20)
 
 struct xp_wave_cache_entry {
   /* Null marks an empty entry. */
@@ -38,6 +43,8 @@ struct xp_wave_cache_entry {
 struct xp_wave_cache {
   struct xp_wave_cache_entry entries[XP_WAVE_CACHE_ENTRIES];
   uint64_t clock;
+  /* Decoded bytes the entries hold. */
+  size_t bytes;
 };
 
 #ifdef __cplusplus
