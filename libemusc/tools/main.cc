@@ -13,6 +13,7 @@
 #include "wav.h"
 #include "audio_out.h"
 #include "version.h"
+#include "cpu_list.h"
 #include "mxcsr_ftz.h"
 #include "rom_paths.h"
 #include "gain.h"
@@ -22,6 +23,7 @@
 #include "wave_rom.h"
 
 #include <cctype>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -108,6 +110,11 @@ drive emusc-render and another renderer with the same options):
                          bytes at every count. No effect on the other devices,
                          or in a build without thread support (32-bit
                          Windows)
+  --cpus LIST            pin the render threads one per CPU in LIST (e.g.
+                         0-3, Linux only): this one on the first, the
+                         pool's from the last down, so a core kept out of
+                         scheduling (isolcpus) still gets one. Without
+                         --threads, one thread per CPU listed
 
 ROM selection (--device and --rom-dir, both defaulted, or the explicit
 --control-rom/--wave-rom/--cpu-rom files, which bypass both):
@@ -198,6 +205,7 @@ struct Options {
   bool max_voices_set = false;
   unsigned max_voices = 0;
   unsigned threads = 0;
+  std::vector<unsigned> cpus;
 };
 
 [[noreturn]] void die(int code, const std::string &msg) {
@@ -272,6 +280,10 @@ Options parse_args(int argc, char **argv) {
     else if (a == "--block")       o.block = static_cast<unsigned>(std::stoul(need("--block")));
     else if (a == "--latency")     o.latency = static_cast<unsigned>(std::stoul(need("--latency")));
     else if (a == "--threads")     o.threads = static_cast<unsigned>(std::stoul(need("--threads")));
+    else if (a == "--cpus") {
+      if (!emusc_tools::parse_cpu_list(need("--cpus"), o.cpus))
+        die(1, "--cpus takes a list such as 0-3 or 0,2,3");
+    }
     else if (a == "--max-voices") {
       o.max_voices_set = true;
       o.max_voices = static_cast<unsigned>(std::stoul(need("--max-voices")));
@@ -505,7 +517,14 @@ int main(int argc, char **argv) {
   // LFO. Re-seed with a fixed value so the render is reproducible.
   EmuSC::Synth::seed_random(o.seed);
   if (o.max_voices_set) synth.set_max_voices(o.max_voices);
-  synth.set_render_threads(o.threads);
+  if (o.cpus.empty()) {
+    synth.set_render_threads(o.threads);
+  } else {
+    if (!emusc_tools::pin_this_thread(o.cpus[0]))
+      std::fprintf(stderr, "emusc-render: cannot pin to CPU %u\n", o.cpus[0]);
+    synth.set_render_threads(o.threads ? o.threads : (unsigned) o.cpus.size(),
+                             emusc_tools::worker_cpus(o.cpus));
+  }
   synth.set_audio_format(o.rate, 2);   // also instantiates the 16 parts
 
   // Power-on reset, before the first event is queued. --reset selects the sound
@@ -671,6 +690,10 @@ int main(int argc, char **argv) {
     static_assert(RENDER_BLOCK_FRAMES <= EVENT_LEAD_FRAMES,
                   "a block's own events must be queued before it renders");
     std::vector<float> rendered(2 * RENDER_BLOCK_FRAMES);
+    // Each block's render time over the time it plays for: the peaks are
+    // what a live engine has to absorb, which the average ratio hides.
+    std::vector<double> block_load;
+    block_load.reserve(total_frames / RENDER_BLOCK_FRAMES + 1);
     size_t next = 0;
     for (uint64_t base = 0; base < total_frames; base += RENDER_BLOCK_FRAMES) {
       const uint64_t count =
@@ -696,7 +719,11 @@ int main(int argc, char **argv) {
         }
         next++;
       }
+      const auto block_begin = clock::now();
       synth.get_next_frames(rendered.data(), count);
+      block_load.push_back(
+        std::chrono::duration<double>(clock::now() - block_begin).count() *
+        o.rate / (double) count);
       for (uint64_t fr = base; fr < base + count; fr++) {
         float l = rendered[2 * (fr - base)], r = rendered[2 * (fr - base) + 1];
         emusc_tools::apply_gain(l, r, gain_lin);
@@ -782,6 +809,20 @@ int main(int argc, char **argv) {
                      (unsigned long long) wav->frames(), o.out.c_str(),
                      render_wall, audio_seconds / render_wall,
                      synth.get_num_clipped_samples(false));
+        if (!block_load.empty()) {
+          std::vector<double> sorted = block_load;
+          std::sort(sorted.begin(), sorted.end());
+          size_t over = 0;
+          for (double l : sorted) over += l > 1.0;
+          std::fprintf(stderr,
+                       "emusc-render: per %llu-frame block, render time over "
+                       "playing time: p50 %.0f%%, p99 %.0f%%, max %.0f%%; "
+                       "%zu of %zu blocks over 100%%\n",
+                       (unsigned long long) RENDER_BLOCK_FRAMES,
+                       100.0 * sorted[sorted.size() / 2],
+                       100.0 * sorted[(sorted.size() * 99) / 100],
+                       100.0 * sorted.back(), over, sorted.size());
+        }
       }
     }
     if (full_scale)
