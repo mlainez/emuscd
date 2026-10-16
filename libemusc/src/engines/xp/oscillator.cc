@@ -537,6 +537,69 @@ float outer_tap(const struct xp_oscillator *oscillator, size_t index,
    reciprocal multiplies and a Pentium III-class target reaches the whole
    expression with scalar SSE1 instead of x87, which carries no float at
    all below SSE2. Same kernel either way. */
+/* The four taps where they are four neighbouring frames of one pass - the
+   initial pass, or one leg of a cycle - each the value value_at reads
+   there, without its per-tap cycle arithmetic (two divisions a tap, and a
+   library call each on an ARMv7 core without a divider). False wherever a
+   tap would wrap, turn, cross into the cycle, or leave the decoded data:
+   the general reads answer those. */
+inline bool plain_taps(const struct xp_oscillator *oscillator, size_t index,
+                       float *left, float *value0, float *value1,
+                       float *right)
+{
+  if (index < 1)
+    return false;
+  int64_t first;       /* address of the left tap */
+  int64_t dir;         /* address step from one tap to the next */
+  bool reflect = false;
+  if (oscillator->initial) {
+    if (index + 2 >= oscillator->initial_count)
+      return false;
+    dir = oscillator->mode == XP_WAVE_REVERSE_ONE_SHOT ? -1 : 1;
+    first = (int64_t)oscillator->start + dir * ((int64_t)index - 1);
+  } else {
+    if (index + 2 >= oscillator->cycle_count)
+      return false;
+    const size_t span = (size_t)(oscillator->end - oscillator->loop) + 1;
+    if (oscillator->mode == XP_WAVE_FORWARD_LOOP) {
+      dir = 1;
+      first = (int64_t)oscillator->loop + (int64_t)index - 1;
+    } else if (oscillator->mode != XP_WAVE_PING_PONG_LOOP) {
+      return false;
+    } else if (index + 2 < span) {
+      dir = -1;
+      first = (int64_t)oscillator->end - 1 - ((int64_t)index - 1);
+      reflect = true;
+    } else if (index - 1 >= span) {
+      dir = 1;
+      first = (int64_t)oscillator->loop + (int64_t)(index - 1 - span);
+    } else {
+      return false;
+    }
+  }
+  const int64_t last = first + 3 * dir;
+  const int64_t lo = (first < last ? first : last) - oscillator->pcm_base;
+  const int64_t hi = (first < last ? last : first) - oscillator->pcm_base;
+  if (lo < 0 || hi >= (int64_t)oscillator->pcm_count)
+    return false;
+  const int32_t *at = oscillator->pcm24 + (first - oscillator->pcm_base);
+  float taps[4];
+  if (reflect) {
+    const float anchor =
+      (float)oscillator->pcm24[oscillator->end - oscillator->pcm_base];
+    for (int k = 0; k < 4; ++k)
+      taps[k] = 2.0f * anchor - (float)at[-k];
+  } else {
+    for (int k = 0; k < 4; ++k)
+      taps[k] = (float)at[k * dir];
+  }
+  *left = taps[0];
+  *value0 = taps[1];
+  *value1 = taps[2];
+  *right = taps[3];
+  return true;
+}
+
 #ifdef EMUSC_LEGACY_DSP_FAST
 float bspline4(float fraction, float left, float value0, float value1,
                 float right)
@@ -597,13 +660,14 @@ bool oscillator_next(struct xp_oscillator *oscillator, float *sample)
   const size_t index = (size_t)oscillator->phase;
   const double fraction = oscillator->phase - (double)index;
 #endif
-  float value0;
-  float value1;
-  if (!value_at(oscillator, index, &value0) ||
-      !value_at(oscillator, index + 1, &value1))
-    return false;
-  float left = outer_tap(oscillator, index, true, value0);
-  float right = outer_tap(oscillator, index + 1, false, value1);
+  float left, value0, value1, right;
+  if (!plain_taps(oscillator, index, &left, &value0, &value1, &right)) {
+    if (!value_at(oscillator, index, &value0) ||
+        !value_at(oscillator, index + 1, &value1))
+      return false;
+    left = outer_tap(oscillator, index, true, value0);
+    right = outer_tap(oscillator, index + 1, false, value1);
+  }
 #ifdef EMUSC_LEGACY_DSP_FAST
   *sample = bspline4(fraction, left, value0, value1, right);
 
