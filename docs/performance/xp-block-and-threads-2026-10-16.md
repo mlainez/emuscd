@@ -46,6 +46,34 @@ faster: they are now bound by the serial part (effects, scheduler, join).
 
 md5 of every render matched main's on the Pi.
 
+## Raspberry Pi 2, live emuscd
+
+`emuscd --cpus 3,0,1,2 --rt 70 --stats --rate 32000 --block 512
+--latency 48`, MIDI from `aplaymidi` on the Pi itself, din5 stopped. Worst
+5-second window of render time per 16 ms block, as a share of the block:
+
+| device / song           | avg | p99 | max | blocks over 100% |
+|-------------------------|-----|-----|-----|------------------|
+| SC-88 mystic (150 s)    | 53% | 70% | 83% | 0                |
+| JV-1080 RISE (whole)    | 58% | 76% | 78% | 0                |
+
+Three things got it there beyond the threads:
+- Live MIDI lands at the start of a block, so a block's note-ons are one
+  serial burst. JV-1080 note-ons decode waves; with a 32-entry cache RISE
+  decoded 1408 times for 190 distinct waves. The cache now holds 512
+  within a 64 MiB budget, and a SCHED_IDLE helper decodes a newly loaded
+  patch's or kit's waves before its notes ask (JV-1080 max 113% -> 78%).
+- `--rt` (SCHED_FIFO, memory locked): an SC-88 run waits for its slowest
+  worker, and on the non-isolated cores workers were preempted ~2500 times
+  a minute (SC-88 max 101-186% -> 83%).
+- `--cpus 3,0,1,2` puts the main thread, which carries the serial work, on
+  the core din5 keeps out of scheduling.
+
+The SC-88 oscillator reads its four taps without per-tap cycle arithmetic
+(two integer divisions a tap, library calls on an ARMv7-A core without a
+divider), and the JV-1080 interpolator reads its taps directly away from
+loop seams: -14% and -11% instructions on x86-64.
+
 ## Single-thread instruction counts (callgrind, x86-64, 40 s at 32 kHz)
 
 | device / song  | main   | now, 1 thread |
