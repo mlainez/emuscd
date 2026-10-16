@@ -243,6 +243,13 @@ bool device_host_reset_enters_gm(const Device *device);
  * to whichever voice path the loaded device uses, so a caller does not
  * have to know which one that is. */
 bool device_set_max_voices(Device *device, unsigned maxVoices);
+/* Renders the voices on `pool`'s threads from the next block on, whichever
+ * voice path the device uses; null, or a one-thread pool, renders them on
+ * the calling thread. The output is the same bytes either way. False, with
+ * the device left on the calling thread, if its voice path cannot take the
+ * pool. The pool is not owned and must outlive the device or be detached
+ * first. */
+bool device_set_worker_pool(Device *device, WorkerPool *pool);
 void device_set_master_volume(Device *device, uint8_t value);
 void device_set_master_pan(Device *device, uint8_t value);
 

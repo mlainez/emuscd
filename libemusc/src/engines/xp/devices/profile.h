@@ -27,6 +27,8 @@
 struct xp_rom;
 
 #ifdef __cplusplus
+namespace EmuSC { namespace Xp { class WorkerPool; } }
+
 extern "C" {
 #endif
 
@@ -144,6 +146,11 @@ struct XpVoiceEngineOps {
      aftertouch. Null on a device that does not act on them. */
   bool (*pitch_bend)(void *state, unsigned channel, unsigned value);
   bool (*channel_pressure)(void *state, unsigned channel, unsigned value);
+  /* Renders the voices on `pool`'s threads, or on the calling thread when
+     pool is null or has one thread, with the same output either way. False,
+     leaving the voices on the calling thread, if the engine cannot take it.
+     Null on a device whose voice path renders on the calling thread only. */
+  bool (*set_worker_pool)(void *state, EmuSC::Xp::WorkerPool *pool);
 };
 
 /* Where a record type keeps each field a voice needs, by role. A device's

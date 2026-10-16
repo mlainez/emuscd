@@ -102,6 +102,12 @@ drive emusc-render and another renderer with the same options):
                          SC-88/JV-1080), trading polyphony for headroom on
                          too slow to sustain the worst case (default: the
                          device's own ceiling - this can only lower it)
+  --threads N            threads the SC-88 and JV-1080 engines render their
+                         voices on, this one included; 0 is one per CPU this
+                         process may use (default: 0). The output is the same
+                         bytes at every count. No effect on the other devices,
+                         or in a build without thread support (32-bit
+                         Windows)
 
 ROM selection (--device and --rom-dir, both defaulted, or the explicit
 --control-rom/--wave-rom/--cpu-rom files, which bypass both):
@@ -191,6 +197,7 @@ struct Options {
   unsigned latency = 500;
   bool max_voices_set = false;
   unsigned max_voices = 0;
+  unsigned threads = 0;
 };
 
 [[noreturn]] void die(int code, const std::string &msg) {
@@ -264,6 +271,7 @@ Options parse_args(int argc, char **argv) {
 #endif
     else if (a == "--block")       o.block = static_cast<unsigned>(std::stoul(need("--block")));
     else if (a == "--latency")     o.latency = static_cast<unsigned>(std::stoul(need("--latency")));
+    else if (a == "--threads")     o.threads = static_cast<unsigned>(std::stoul(need("--threads")));
     else if (a == "--max-voices") {
       o.max_voices_set = true;
       o.max_voices = static_cast<unsigned>(std::stoul(need("--max-voices")));
@@ -497,6 +505,7 @@ int main(int argc, char **argv) {
   // LFO. Re-seed with a fixed value so the render is reproducible.
   EmuSC::Synth::seed_random(o.seed);
   if (o.max_voices_set) synth.set_max_voices(o.max_voices);
+  synth.set_render_threads(o.threads);
   synth.set_audio_format(o.rate, 2);   // also instantiates the 16 parts
 
   // Power-on reset, before the first event is queued. --reset selects the sound

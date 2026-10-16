@@ -21,6 +21,7 @@
 #include "engines/gp/part.h"
 #include "engines/gp/random.h"
 #include "engines/xp/device.h"
+#include "engines/xp/common/worker_pool.h"
 #include "settings.h"
 
 #include <cstring>
@@ -125,6 +126,8 @@ bool Synth::_xp_configure(uint32_t sampleRate)
   }
   if (_maxVoicesSet)
     Xp::device_set_max_voices(_xpDevice, _maxVoices);
+  if (_renderPool)
+    Xp::device_set_worker_pool(_xpDevice, _renderPool);
 
   return true;
 }
@@ -139,6 +142,32 @@ void Synth::set_max_voices(unsigned maxVoices)
 }
 
 
+void Synth::set_render_threads(unsigned threads)
+{
+  if (_xpDevice)
+    Xp::device_set_worker_pool(_xpDevice, nullptr);
+  delete _renderPool;
+  _renderPool = nullptr;
+  if (threads == 1)
+    return;
+  Xp::WorkerPool *pool = new Xp::WorkerPool(threads);
+  if (pool->threads() <= 1) {
+    delete pool;
+    return;
+  }
+  _renderPool = pool;
+  if (_xpDevice && !Xp::device_set_worker_pool(_xpDevice, _renderPool)) {
+    delete _renderPool;
+    _renderPool = nullptr;
+  }
+}
+
+
+unsigned Synth::render_threads(void) const
+{
+  return _renderPool ? _renderPool->threads() : 1u;
+}
+
 
 Synth::~Synth()
 {
@@ -147,6 +176,7 @@ Synth::~Synth()
     delete _xpDevice;
     _xpDevice = nullptr;
   }
+  delete _renderPool;
 
   _parts.clear();
   delete _settings;

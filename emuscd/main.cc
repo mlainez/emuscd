@@ -57,6 +57,7 @@ class EmuscdDaemon {
   snd_pcm_t* pcm_out = nullptr;
   unsigned int sample_rate;
   unsigned int block_frames;
+  unsigned int render_threads;
   float gain_lin;
 
   std::unique_ptr<EmuSC::ControlRom> ctrl_rom;
@@ -74,9 +75,10 @@ public:
   EmuscdDaemon(const std::string& dev, const std::string& port_name,
                const std::string& pcm_device, const std::string& rom_directory,
                unsigned int requested_rate, unsigned int latency_ms,
-               unsigned int block, double gain_db)
+               unsigned int block, unsigned int threads, double gain_db)
       : sample_rate(requested_rate), block_frames(block),
-        gain_lin(gain_db_to_linear(gain_db)), rom_dir(rom_directory) {
+        render_threads(threads), gain_lin(gain_db_to_linear(gain_db)),
+        rom_dir(rom_directory) {
     init_alsa_midi(port_name);
     init_alsa_audio(pcm_device, latency_ms);
     if (!load_device(dev)) {
@@ -174,6 +176,7 @@ public:
     std::unique_ptr<EmuSC::Synth> new_synth(
       new EmuSC::Synth(*new_ctrl, *new_wave, SOUND_MAP));
     new_synth->set_audio_format(sample_rate, 2);
+    new_synth->set_render_threads(render_threads);
 
     // Power-on reset, which is what the hardware does when it is switched on
     // and what a GS reset in the stream asks for later. It must follow
@@ -344,6 +347,7 @@ int main(int argc, char* argv[]) {
   unsigned int rate = 48000;
   unsigned int latency_ms = 20;
   unsigned int block = 256;
+  unsigned int threads = 0;
   double gain_db = 0.0;
 
   for (int i = 1; i < argc; i++) {
@@ -376,6 +380,8 @@ int main(int argc, char* argv[]) {
         std::cerr << "emuscd: --block must be >= 1" << std::endl;
         return 1;
       }
+    } else if (arg == "--threads") {
+      threads = static_cast<unsigned int>(std::stoul(need("--threads")));
     } else if (arg == "--gain-db") {
       gain_db = std::stod(need("--gain-db"));
     } else if (arg == "--help" || arg == "-h") {
@@ -394,6 +400,10 @@ int main(int argc, char* argv[]) {
           << "  --rate HZ           Requested audio sample rate (default: 48000)\n"
           << "  --latency MS        Requested output buffer size (default: 20)\n"
           << "  --block N           Audio frames per ALSA write (default: 256)\n"
+          << "  --threads N         Threads the SC-88 and JV-1080 render their voices\n"
+          << "                       on, this one included; 0 is one per CPU this\n"
+          << "                       process may use (default: 0). The audio is the\n"
+          << "                       same at every count\n"
           << "  --gain-db DB        Output gain in dB, linear multiplier 10^(DB/20)\n"
           << "                       applied to the final samples (default: 0, no\n"
           << "                       change - a listening-convenience knob only)\n"
@@ -419,7 +429,7 @@ int main(int argc, char* argv[]) {
 
   try {
     EmuscdDaemon daemon(device, port_name, pcm_device, rom_dir, rate,
-                         latency_ms, block, gain_db);
+                         latency_ms, block, threads, gain_db);
     daemon.run();
   } catch (const std::exception& e) {
     std::cerr << "Fatal error: " << e.what() << std::endl;

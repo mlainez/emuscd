@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: CC0-1.0 */
 #include "device.h"
 
+#include "common/worker_pool.h"
 #include "devices/sc88.h"
 
 #include <cstdlib>
@@ -879,6 +880,18 @@ bool device_set_max_voices(Device *device, unsigned maxVoices)
   if (device->voice_ops)
     return device->voice_ops->set_max_voices(device->voice_state, maxVoices);
   return engine_set_max_voices(&device->engine, maxVoices);
+}
+
+bool device_set_worker_pool(Device *device, WorkerPool *pool)
+{
+  if (!device || !device->initialized)
+    return false;
+  if (device->voice_ops) {
+    if (!device->voice_ops->set_worker_pool)
+      return !pool || pool->threads() <= 1;
+    return device->voice_ops->set_worker_pool(device->voice_state, pool);
+  }
+  return engine_set_worker_pool(&device->engine, pool);
 }
 
 void device_set_master_volume(Device *device, uint8_t value)

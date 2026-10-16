@@ -2,11 +2,13 @@
 #include "engine.h"
 
 #include "common/constants.h"
+#include "common/worker_pool.h"
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 
 namespace EmuSC { namespace Xp {
 
@@ -1041,6 +1043,7 @@ void engine_destroy(struct xp_engine *engine)
     if (engine->stopping[i].active)
       renderer_component_release(engine->renderer,
                                  &engine->stopping[i].component);
+  delete engine->segment;
   std::memset(engine, 0, sizeof *engine);
 }
 
@@ -1310,6 +1313,338 @@ void engine_set_stage_taps(struct xp_engine *engine,
     std::memset(&engine->stage_taps, 0, sizeof engine->stage_taps);
 }
 
+namespace {
+
+/* The four amplitude-stage taps of one frame, for the stage-tap probe. */
+struct FrameTaps {
+  float oscillator, tvf, staticGain, tva, lfo;
+};
+
+/* The buses one frame of voices is summed into. */
+struct FrameMix {
+  float left, right, reverb, chorus, delay;
+};
+
+/* What a voice's gained sample is multiplied by on its way into each bus.
+   Every factor is fixed between two serviced control periods - the pan
+   moves only in runScheduler, the sends only with MIDI between blocks -
+   which is what lets one voice's frames be rendered ahead of the others'
+   and summed afterwards. */
+struct VoiceBuses {
+  float left, right;
+  float reverbGain, chorusGain, delayGain;
+  bool reverb, chorus, delay;
+};
+
+inline void slotBuses(const struct xp_engine *engine,
+                      const struct xp_engine_slot *slot, bool send,
+                      bool chorusSend, bool delaySend,
+                      struct VoiceBuses *buses)
+{
+  buses->left = slot->component.left_gain_q15 / 32768.0f;
+  buses->right = slot->component.right_gain_q15 / 32768.0f;
+  buses->reverb = buses->chorus = buses->delay = false;
+  if (slot->note >= XP_ENGINE_NOTE_COUNT)
+    return;
+  const struct xp_engine_part *part =
+    engine->parts + engine->notes[slot->note].part;
+  /* A rhythm note's send is its part's control combined with its own from
+     its kit record, through the firmware's rounded product and the ROM's
+     send curve. A melodic component carries 127 and so keeps its part's
+     control unchanged. */
+  if (send)
+    buses->reverb = xp_renderer_send_gain(
+      engine->renderer,
+      send_combine(part->reverb_send, slot->component.reverb_send),
+      &buses->reverbGain);
+  /* The delay bus takes the part's send alone: a rhythm note's own delay
+     send lives in RAM at `+0x50c`, not in the kit record. */
+  if (delaySend)
+    buses->delay = xp_renderer_send_gain(engine->renderer, part->delay_send,
+                                         &buses->delayGain);
+  /* The chorus bus is formed the same way, from part byte `+0e` and the
+     kit's `+0x400` (`08_effects/routing.md`). */
+  if (chorusSend)
+    buses->chorus = xp_renderer_send_gain(
+      engine->renderer,
+      send_combine(part->chorus_send, slot->component.chorus_send),
+      &buses->chorusGain);
+}
+
+inline void stopBuses(const struct xp_engine *engine,
+                      const struct xp_engine_stopping *stop, bool send,
+                      bool chorusSend, bool delaySend,
+                      struct VoiceBuses *buses)
+{
+  const struct xp_engine_part *part = engine->parts + stop->part;
+  buses->left = stop->component.left_gain_q15 / 32768.0f;
+  buses->right = stop->component.right_gain_q15 / 32768.0f;
+  buses->reverb = send && xp_renderer_send_gain(
+    engine->renderer,
+    send_combine(part->reverb_send, stop->component.reverb_send),
+    &buses->reverbGain);
+  buses->delay = delaySend &&
+    xp_renderer_send_gain(engine->renderer, part->delay_send,
+                          &buses->delayGain);
+  buses->chorus = chorusSend && xp_renderer_send_gain(
+    engine->renderer,
+    send_combine(part->chorus_send, stop->component.chorus_send),
+    &buses->chorusGain);
+}
+
+inline void mixVoice(struct FrameMix *mix, const struct VoiceBuses *buses,
+                     float gained)
+{
+  mix->left += gained * buses->left;
+  mix->right += gained * buses->right;
+  if (buses->reverb)
+    mix->reverb += gained * buses->reverbGain;
+  if (buses->delay)
+    mix->delay += gained * buses->delayGain;
+  if (buses->chorus)
+    mix->chorus += gained * buses->chorusGain;
+}
+
+/* One frame of an allocated slot's voice, as the gain every bus takes it
+   at. False, producing nothing, once the voice has run out: the caller
+   frees the slot at that frame. */
+inline bool slotFrame(const struct xp_engine *engine,
+                      struct xp_engine_slot *slot, double periodFraction,
+                      double fractionStep, double staticGainProgress,
+                      struct FrameTaps *taps, float *gainedOut)
+{
+  float sample;
+  if (!slot->component.active ||
+      !oscillator_next(&slot->component.oscillator, &sample))
+    return false;
+  taps->oscillator += sample;
+  if (engine->renderer->tvf_audio_transfer)
+    sample = engine->renderer->tvf_audio_transfer(
+      engine->renderer->tvf_audio_user, &slot->component.tvf_audio,
+      &slot->component.tvf, periodFraction, sample);
+  taps->tvf += sample;
+  uint32_t envelopeGain = tva_envelope_render_q17(
+    &engine->renderer->rom, &slot->component.envelope, periodFraction,
+    fractionStep);
+  /* The chip's amplitude register, not the CPU's composed target: the
+     target is a step once per control period and the register is the ramp
+     between two of them. */
+  float staticGain = xp_render_static_gain_q17_from_progress(
+    &slot->component, staticGainProgress) / 131072.0f;
+  taps->staticGain += sample * staticGain;
+  taps->tva += sample * staticGain * (envelopeGain / 131072.0f);
+  float gained = sample * staticGain *
+    (envelopeGain / 131072.0f) *
+    slot->lfo_amplitude_gain *
+    engine->notes[slot->note].provisional_gain;
+  taps->lfo += gained;
+  if (slot->component.oscillator.ended)
+    slot->component.active = false;
+  *gainedOut = gained;
+  return true;
+}
+
+/* One frame of a voice the CPU has already handed its slot back. Nothing
+   composes for it any more: the amplitude register runs down to the zero
+   the stop wrote, on its own clock, and the rest of the voice - oscillator,
+   filter, pan - carries on from exactly where it stood. False, producing
+   nothing, once the register has arrived at zero or the sample has run out
+   first: the caller releases the voice at that frame. */
+inline bool stopFrame(const struct xp_engine *engine,
+                      struct xp_engine_stopping *stop, double periodFraction,
+                      struct FrameTaps *taps, float *gainedOut)
+{
+  uint32_t registerQ17 =
+    xp_render_static_gain_q17(&stop->component, stop->periods);
+  float sample;
+  if (!registerQ17 || !stop->component.active ||
+      !oscillator_next(&stop->component.oscillator, &sample))
+    return false;
+  taps->oscillator += sample;
+  if (engine->renderer->tvf_audio_transfer)
+    sample = engine->renderer->tvf_audio_transfer(
+      engine->renderer->tvf_audio_user, &stop->component.tvf_audio,
+      &stop->component.tvf, periodFraction, sample);
+  taps->tvf += sample;
+  /* One frozen product for the three amplitude taps: the envelope, the
+     oscillators and the note gain no longer move apart. */
+  float gained = sample * (registerQ17 / 131072.0f) * stop->gain;
+  taps->staticGain += gained;
+  taps->tva += gained;
+  taps->lfo += gained;
+  if (stop->component.oscillator.ended)
+    stop->component.active = false;
+  stop->periods += kXpControlTimerHz /
+    (engine->renderer->output_rate * kXpControlPeriodClocks);
+  *gainedOut = gained;
+  return true;
+}
+
+void releaseStop(struct xp_engine *engine, struct xp_engine_stopping *stop)
+{
+  renderer_component_release(engine->renderer, &stop->component);
+  std::memset(stop, 0, sizeof *stop);
+}
+
+void storeFrame(const struct FrameMix *mix, float *stereo, float *send,
+                float *chorusSend, float *delaySend, size_t frame)
+{
+  stereo[frame * 2] = mix->left;
+  stereo[frame * 2 + 1] = mix->right;
+  if (send)
+    send[frame] = mix->reverb;
+  if (chorusSend)
+    chorusSend[frame] = mix->chorus;
+  if (delaySend)
+    delaySend[frame] = mix->delay;
+}
+
+constexpr unsigned kSegmentVoices =
+  XP_ENGINE_SLOT_COUNT + XP_ENGINE_STOPPING_COUNT;
+
+}  // namespace
+
+/* One segment of the multi-threaded render: the frames from one scheduler
+   call that may service a period up to the next, or to the end of the
+   block. */
+struct EngineSegment {
+  struct xp_engine *engine;
+  size_t frames;
+  double fractionStep;
+  double periodFraction[XP_ENGINE_SEGMENT_FRAMES];
+  double staticGainProgress[XP_ENGINE_SEGMENT_FRAMES];
+  /* The voices in the order the single-threaded loop visits them: the
+     allocated slots ascending, then the stopping voices ascending. */
+  unsigned slotCount;
+  uint8_t index[kSegmentVoices];
+  struct VoiceBuses buses[kSegmentVoices];
+  /* The frame each voice ran out at, or `frames` if it did not. */
+  size_t end[kSegmentVoices];
+  float gained[kSegmentVoices][XP_ENGINE_SEGMENT_FRAMES];
+};
+
+namespace {
+
+void renderSegmentVoice(void *context, unsigned v)
+{
+  EngineSegment *segment = (EngineSegment *)context;
+  const struct xp_engine *engine = segment->engine;
+  float *gained = segment->gained[v];
+  /* Nothing reads a threaded voice's taps: a tapped engine is never
+     threaded. */
+  struct FrameTaps taps = {};
+  size_t f = 0;
+  if (v < segment->slotCount) {
+    struct xp_engine_slot *slot = segment->engine->slots + segment->index[v];
+    for (; f < segment->frames; ++f)
+      if (!slotFrame(engine, slot, segment->periodFraction[f],
+                     segment->fractionStep, segment->staticGainProgress[f],
+                     &taps, gained + f))
+        break;
+  } else {
+    struct xp_engine_stopping *stop =
+      segment->engine->stopping + segment->index[v];
+    for (; f < segment->frames; ++f)
+      if (!stopFrame(engine, stop, segment->periodFraction[f], &taps,
+                     gained + f))
+        break;
+  }
+  segment->end[v] = f;
+}
+
+void renderThreaded(struct xp_engine *engine, float *stereo, float *send,
+                    float *chorusSend, float *delaySend, size_t frames,
+                    double fractionStep)
+{
+  EngineSegment *segment = engine->segment;
+  segment->engine = engine;
+  segment->fractionStep = fractionStep;
+  const double clockStep = kXpControlTimerHz / engine->renderer->output_rate;
+  size_t done = 0;
+  while (done < frames) {
+    /* The segment opens on a scheduler call that may service a period and
+       runs on through every frame whose call would only move the clock -
+       which is all runScheduler does when no period has elapsed, so that
+       step is taken here instead, with the same arithmetic. */
+    runScheduler(engine);
+    size_t n = 0;
+    for (;;) {
+      segment->periodFraction[n] =
+        engine->scheduler_clocks / kXpControlPeriodClocks;
+      segment->staticGainProgress[n] =
+        xp_static_gain_progress(segment->periodFraction[n]);
+      ++n;
+      if (done + n >= frames || n >= XP_ENGINE_SEGMENT_FRAMES)
+        break;
+      double clocks = engine->scheduler_clocks + clockStep;
+      if ((unsigned)(clocks / kXpControlPeriodClocks))
+        break;
+      engine->scheduler_clocks = clocks;
+    }
+    segment->frames = n;
+
+    unsigned count = 0;
+    for (unsigned k = 0; k < engine->active_slot_count; ++k, ++count) {
+      segment->index[count] = engine->active_slots[k];
+      slotBuses(engine, engine->slots + engine->active_slots[k],
+                send != nullptr, chorusSend != nullptr,
+                delaySend != nullptr, segment->buses + count);
+    }
+    segment->slotCount = count;
+    for (unsigned i = 0; i < XP_ENGINE_STOPPING_COUNT; ++i) {
+      if (!engine->stopping[i].active)
+        continue;
+      segment->index[count] = (uint8_t)i;
+      stopBuses(engine, engine->stopping + i, send != nullptr,
+                chorusSend != nullptr, delaySend != nullptr,
+                segment->buses + count);
+      ++count;
+    }
+
+    engine->pool->run(count, renderSegmentVoice, segment);
+
+    for (size_t f = 0; f < n; ++f) {
+      struct FrameMix mix = {};
+      for (unsigned v = 0; v < count; ++v)
+        if (f < segment->end[v])
+          mixVoice(&mix, segment->buses + v, segment->gained[v][f]);
+      storeFrame(&mix, stereo, send, chorusSend, delaySend, done + f);
+    }
+    /* The voices that ran out, handed back in the order the
+       single-threaded loop hands them back: by frame, and within a frame
+       the slots before the stopping voices, each ascending. */
+    for (size_t f = 0; f < n; ++f)
+      for (unsigned v = 0; v < count; ++v) {
+        if (segment->end[v] != f)
+          continue;
+        if (v < segment->slotCount)
+          freeSlot(engine, segment->index[v], false);
+        else
+          releaseStop(engine, engine->stopping + segment->index[v]);
+      }
+    done += n;
+  }
+}
+
+}  // namespace
+
+bool engine_set_worker_pool(struct xp_engine *engine,
+                             EmuSC::Xp::WorkerPool *pool)
+{
+  if (!engine)
+    return false;
+  engine->pool = nullptr;
+  if (!pool || pool->threads() <= 1)
+    return true;
+  if (!engine->segment) {
+    engine->segment = new (std::nothrow) EngineSegment;
+    if (!engine->segment)
+      return false;
+  }
+  engine->pool = pool;
+  return true;
+}
+
 void engine_render_with_send(struct xp_engine *engine, float *stereo,
                               float *send, float *chorusSend,
                               float *delaySend, size_t frames)
@@ -1322,14 +1657,17 @@ void engine_render_with_send(struct xp_engine *engine, float *stereo,
   const double fractionStep =
     (kXpControlTimerHz / engine->renderer->output_rate) /
     kXpControlPeriodClocks;
+  const bool tapped = engine->stage_taps.oscillator ||
+    engine->stage_taps.after_tvf || engine->stage_taps.after_static ||
+    engine->stage_taps.after_tva || engine->stage_taps.after_lfo;
+  if (engine->pool && !tapped) {
+    renderThreaded(engine, stereo, send, chorusSend, delaySend, frames,
+                   fractionStep);
+    return;
+  }
   for (size_t frame = 0; frame < frames; ++frame) {
-    float left = 0.0f;
-    float right = 0.0f;
-    float bus = 0.0f;
-    float chorusBus = 0.0f;
-    float delayBus = 0.0f;
-    float tapOsc = 0.0f, tapTvf = 0.0f, tapStatic = 0.0f;
-    float tapTva = 0.0f, tapLfo = 0.0f;
+    struct FrameMix mix = {};
+    struct FrameTaps taps = {};
     runScheduler(engine);
     /* Loop-invariant: scheduler_clocks only moves inside runScheduler,
        above, so this is the same value for every voice this frame - and
@@ -1354,150 +1692,43 @@ void engine_render_with_send(struct xp_engine *engine, float *stereo,
     while (activeIndex < engine->active_slot_count) {
       uint8_t slotIndex = engine->active_slots[activeIndex];
       struct xp_engine_slot *slot = engine->slots + slotIndex;
-      float sample;
-      bool freed = false;
-      if (slot->component.active &&
-          oscillator_next(&slot->component.oscillator, &sample)) {
-        tapOsc += sample;
-        if (engine->renderer->tvf_audio_transfer)
-          sample = engine->renderer->tvf_audio_transfer(
-            engine->renderer->tvf_audio_user, &slot->component.tvf_audio,
-            &slot->component.tvf, periodFraction, sample);
-        tapTvf += sample;
-        uint32_t envelopeGain = tva_envelope_render_q17(
-          &engine->renderer->rom, &slot->component.envelope,
-          periodFraction, fractionStep);
-        /* The chip's amplitude register, not the CPU's composed target:
-           the target is a step once per control period and the register
-           is the ramp between two of them. */
-        float staticGain = xp_render_static_gain_q17_from_progress(
-          &slot->component, staticGainProgress) / 131072.0f;
-        tapStatic += sample * staticGain;
-        tapTva += sample * staticGain * (envelopeGain / 131072.0f);
-        float gained = sample * staticGain *
-          (envelopeGain / 131072.0f) *
-          slot->lfo_amplitude_gain *
-          engine->notes[slot->note].provisional_gain;
-        tapLfo += gained;
-        left += gained * (slot->component.left_gain_q15 / 32768.0f);
-        right += gained * (slot->component.right_gain_q15 / 32768.0f);
-        /* A rhythm note's send is its part's control combined with its own
-           from its kit record, through the firmware's rounded product and
-           the ROM's send curve. A melodic component carries 127 and so
-           keeps its part's control unchanged. */
-        if (send && slot->note < XP_ENGINE_NOTE_COUNT) {
-          float sendGain;
-          uint8_t control = send_combine(
-            engine->parts[engine->notes[slot->note].part].reverb_send,
-            slot->component.reverb_send);
-          if (xp_renderer_send_gain(engine->renderer, control, &sendGain))
-            bus += gained * sendGain;
-        }
-        /* The delay bus takes the part's send alone: a rhythm note's own
-           delay send lives in RAM at `+0x50c`, not in the kit record. */
-        if (delaySend && slot->note < XP_ENGINE_NOTE_COUNT) {
-          float sendGain;
-          if (xp_renderer_send_gain(
-                engine->renderer,
-                engine->parts[engine->notes[slot->note].part].delay_send,
-                &sendGain))
-            delayBus += gained * sendGain;
-        }
-        /* The chorus bus is formed the same way, from part byte `+0e` and
-           the kit's `+0x400` (`08_effects/routing.md`). */
-        if (chorusSend && slot->note < XP_ENGINE_NOTE_COUNT) {
-          float sendGain;
-          uint8_t control = send_combine(
-            engine->parts[engine->notes[slot->note].part].chorus_send,
-            slot->component.chorus_send);
-          if (xp_renderer_send_gain(engine->renderer, control, &sendGain))
-            chorusBus += gained * sendGain;
-        }
-        if (slot->component.oscillator.ended)
-          slot->component.active = false;
-      } else {
+      float gained;
+      if (!slotFrame(engine, slot, periodFraction, fractionStep,
+                     staticGainProgress, &taps, &gained)) {
         freeSlot(engine, slotIndex, false);
-        freed = true;
+        continue;
       }
-      if (!freed)
-        ++activeIndex;
+      struct VoiceBuses buses;
+      slotBuses(engine, slot, send != nullptr, chorusSend != nullptr,
+                delaySend != nullptr, &buses);
+      mixVoice(&mix, &buses, gained);
+      ++activeIndex;
     }
-    /* The voices the CPU has already handed their slots back. Nothing
-       composes for them any more: the amplitude register runs down to the
-       zero the stop wrote, on its own clock, and the rest of the voice -
-       oscillator, filter, pan - carries on from exactly where it stood. */
     for (unsigned i = 0; i < XP_ENGINE_STOPPING_COUNT; ++i) {
       struct xp_engine_stopping *stop = engine->stopping + i;
       if (!stop->active)
         continue;
-      uint32_t registerQ17 =
-        xp_render_static_gain_q17(&stop->component, stop->periods);
-      float sample;
-      if (!registerQ17 || !stop->component.active ||
-          !oscillator_next(&stop->component.oscillator, &sample)) {
-        /* The register has arrived at zero, or the sample ran out first. */
-        renderer_component_release(engine->renderer, &stop->component);
-        std::memset(stop, 0, sizeof *stop);
+      float gained;
+      if (!stopFrame(engine, stop, periodFraction, &taps, &gained)) {
+        releaseStop(engine, stop);
         continue;
       }
-      tapOsc += sample;
-      if (engine->renderer->tvf_audio_transfer)
-        sample = engine->renderer->tvf_audio_transfer(
-          engine->renderer->tvf_audio_user, &stop->component.tvf_audio,
-          &stop->component.tvf, periodFraction, sample);
-      tapTvf += sample;
-      /* One frozen product for the three amplitude taps: the envelope, the
-         oscillators and the note gain no longer move apart. */
-      float gained = sample * (registerQ17 / 131072.0f) * stop->gain;
-      tapStatic += gained;
-      tapTva += gained;
-      tapLfo += gained;
-      left += gained * (stop->component.left_gain_q15 / 32768.0f);
-      right += gained * (stop->component.right_gain_q15 / 32768.0f);
-      if (send) {
-        float sendGain;
-        uint8_t control = send_combine(engine->parts[stop->part].reverb_send,
-                                        stop->component.reverb_send);
-        if (xp_renderer_send_gain(engine->renderer, control, &sendGain))
-          bus += gained * sendGain;
-      }
-      if (delaySend) {
-        float sendGain;
-        if (xp_renderer_send_gain(engine->renderer,
-                                     engine->parts[stop->part].delay_send,
-                                     &sendGain))
-          delayBus += gained * sendGain;
-      }
-      if (chorusSend) {
-        float sendGain;
-        uint8_t control = send_combine(engine->parts[stop->part].chorus_send,
-                                        stop->component.chorus_send);
-        if (xp_renderer_send_gain(engine->renderer, control, &sendGain))
-          chorusBus += gained * sendGain;
-      }
-      if (stop->component.oscillator.ended)
-        stop->component.active = false;
-      stop->periods += kXpControlTimerHz /
-        (engine->renderer->output_rate * kXpControlPeriodClocks);
+      struct VoiceBuses buses;
+      stopBuses(engine, stop, send != nullptr, chorusSend != nullptr,
+                delaySend != nullptr, &buses);
+      mixVoice(&mix, &buses, gained);
     }
-    stereo[frame * 2] = left;
-    stereo[frame * 2 + 1] = right;
-    if (send)
-      send[frame] = bus;
+    storeFrame(&mix, stereo, send, chorusSend, delaySend, frame);
     if (engine->stage_taps.oscillator)
-      engine->stage_taps.oscillator[frame] = tapOsc;
+      engine->stage_taps.oscillator[frame] = taps.oscillator;
     if (engine->stage_taps.after_tvf)
-      engine->stage_taps.after_tvf[frame] = tapTvf;
+      engine->stage_taps.after_tvf[frame] = taps.tvf;
     if (engine->stage_taps.after_static)
-      engine->stage_taps.after_static[frame] = tapStatic;
+      engine->stage_taps.after_static[frame] = taps.staticGain;
     if (engine->stage_taps.after_tva)
-      engine->stage_taps.after_tva[frame] = tapTva;
+      engine->stage_taps.after_tva[frame] = taps.tva;
     if (engine->stage_taps.after_lfo)
-      engine->stage_taps.after_lfo[frame] = tapLfo;
-    if (chorusSend)
-      chorusSend[frame] = chorusBus;
-    if (delaySend)
-      delaySend[frame] = delayBus;
+      engine->stage_taps.after_lfo[frame] = taps.lfo;
   }
 }
 

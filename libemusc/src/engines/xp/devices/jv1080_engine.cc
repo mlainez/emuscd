@@ -36,6 +36,7 @@
 #include "../dynamics.h"
 #include "../efx.h"
 #include "../common/constants.h"
+#include "../common/worker_pool.h"
 
 #include "../packed_rom.h"
 #include "../rom.h"
@@ -43,6 +44,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 
 namespace EmuSC { namespace Xp {
 
@@ -1075,7 +1077,15 @@ struct Engine {
   float efx_dry;
   float efx_level;
   bool efx_ready;
+  /* Where jv_render_native renders its voices, or null to render them on
+     the calling thread; not owned. */
+  WorkerPool *pool;
+  /* Owned; allocated by the first engine_set_worker_pool_jv that sets a
+     pool. */
+  struct VoiceBatch *batch;
 };
+
+void voice_batch_free(struct VoiceBatch *batch);
 
 /* THE PART'S REVERB SEND IS THE LIVE ONE, not the tone's (`M-039`,
    `M-052`), so a voice carries its part's send from note-on. */
@@ -2994,6 +3004,7 @@ void engine_free(void *state)
   std::free(engine->efx_buf[1]);
   if (engine->resampling)
     jv_resampler_free(&engine->resampler);
+  voice_batch_free(engine->batch);
   std::free(engine);
 }
 
@@ -4047,6 +4058,123 @@ bool engine_sysex_block(void *state, const uint8_t *address,
   return false;                  /* a rhythm key, or a block not held */
 }
 
+namespace {
+
+/* The most frames jv_render_native renders its voices for at once. */
+const size_t kRenderChunk = 512u;
+
+/* Where one voice's output goes this block. */
+enum VoiceRoute : uint8_t {
+  kRouteDropped,      /* rendered, then not heard */
+  kRouteInsert,       /* the insert's own bus */
+  kRouteSends,        /* the mix, and the chorus and reverb sends */
+  kRouteMix           /* the mix alone */
+};
+
+VoiceRoute voice_route(const struct Engine *engine, const struct Voice *voice)
+{
+  /* A voice assigned to OUTPUT1 or OUTPUT2 leaves the machine by its own
+     jacks and is not on the MIX bus the chorus and reverb return to, so it
+     is rendered - it still holds its slot and runs its envelopes - and then
+     dropped. Whether its per-voice sends survive that routing is NOT
+     established, so it sends nothing rather than sending something
+     unverified.
+
+     MEASURED EXPOSURE, before this changed anything: across all three
+     factory demo songs exactly one record asks for OUTPUT1 - tone 1 of part
+     1 in `1080 rave` - and that part's own assign reads EFX, so the part
+     decides and the tone's OUTPUT1 never applies. No voice in any of the
+     three is affected. */
+  if (voice->destination == kOutputOne || voice->destination == kOutputTwo)
+    return kRouteDropped;
+  /* A voice bound for the insert goes to the insert's own bus, but only
+     while there is an insert to go to: an effect type this engine does not
+     render leaves its voices on the mix, where they have been all along,
+     rather than dropping them into a bus nothing reads. */
+  if (voice->destination == kOutputEfx && engine->efx_ready)
+    return kRouteInsert;
+  /* The reverb bus is live whichever shape the module has taken: the tank
+     on types 0..5, the panning delay on type 7. */
+  bool reverbLive = engine->reverb_ready || engine->delay_ready;
+  if ((reverbLive && voice->reverb_send > 0.0f) ||
+      (engine->chorus_ready && voice->chorus_send > 0.0f))
+    return kRouteSends;
+  return kRouteMix;
+}
+
+/* A sending voice's block, rendered on its own, into the mix and both
+   sends. */
+void mix_with_sends(const struct Voice *voice, const float *vl,
+                    const float *vr, const float *vc, float *left,
+                    float *right, float *send, float *csend, size_t n)
+{
+  /* THE CHORUS SEND IS TAKEN BEFORE THE PAN. On the device a centred
+     voice's first chorus echo, at depth 0 and feedback 0, is 3.14 dB above
+     its own dry signal on both channels, on every depth-0 tick of
+     `chorus_fb/system_feedback_ticks` (`P-xxxx`). The pan is
+     constant-power, so a centred voice reaches each channel at 0.7071 of
+     its unpanned level: a send taken before the pan predicts +3.01 dB, and
+     the post-pan mean of the two channels predicts 0 dB. Only the centred
+     case is measured; that an off-centre voice sends the same is what
+     "before the pan" means, and no capture yet varies the pan with the
+     chorus open. The reverb send stays on the post-pan mean: its returns
+     were calibrated through it, and PAN-DLY's first repeat reads +2.7 dB
+     over the dry against the device's +3.0 that way. */
+  for (size_t k = 0; k < n; ++k) {
+    float mono = 0.5f * (vl[k] + vr[k]);
+    left[k] += vl[k];
+    right[k] += vr[k];
+    send[k] += voice->reverb_send * mono;
+    csend[k] += voice->chorus_send * vc[k];
+  }
+}
+
+/* One block of every voice, for rendering them on several threads. Each
+   voice renders into a block of its own, which holds exactly what the
+   single-threaded loop would have added into the shared buses: a voice
+   adds each sample once into a zeroed span, and 0 + x is x. The blocks are
+   then summed in voice order, as that loop sums them. */
+struct VoiceBlock {
+  float left[kRenderChunk];
+  float right[kRenderChunk];
+  float unpanned[kRenderChunk];
+};
+
+struct VoiceBatch {
+  size_t frames;
+  unsigned count;
+  struct Voice *voice[kMaxVoices];
+  VoiceRoute route[kMaxVoices];
+  bool alive[kMaxVoices];
+  struct VoiceBlock block[kMaxVoices];
+};
+
+/* Below this many frames a chunk renders its voices on the calling thread:
+   the resampling path asks for one native frame at a time, which leaves a
+   worker nothing to do but wait. */
+const size_t kThreadedMinFrames = 32u;
+
+void voice_batch_free(struct VoiceBatch *batch)
+{
+  delete batch;
+}
+
+void render_batch_voice(void *context, unsigned k)
+{
+  struct VoiceBatch *batch = (struct VoiceBatch *)context;
+  struct VoiceBlock *block = batch->block + k;
+  size_t n = batch->frames;
+  std::memset(block->left, 0, n * sizeof *block->left);
+  std::memset(block->right, 0, n * sizeof *block->right);
+  bool unpanned = batch->route[k] == kRouteSends;
+  if (unpanned)
+    std::memset(block->unpanned, 0, n * sizeof *block->unpanned);
+  batch->alive[k] = render_voice(batch->voice[k], block->left, block->right,
+                                 n, unpanned ? block->unpanned : nullptr);
+}
+
+}  // namespace
+
 /* `frames` of the engine's own 32 kHz output, added into `stereo`. */
 void jv_render_native(struct Engine *engine, float *stereo, size_t frames)
 {
@@ -4060,7 +4188,7 @@ void jv_render_native(struct Engine *engine, float *stereo, size_t frames)
      the bus is its PART's send, which is the live one on this device and
      the tone's is inert (`M-039`, `M-052`). A voice with no send is summed
      straight into the mix as before. */
-  static const size_t kChunk = 512u;
+  static const size_t kChunk = kRenderChunk;
   float left[kChunk];
   float right[kChunk];
   float vl[kChunk];
@@ -4085,81 +4213,83 @@ void jv_render_native(struct Engine *engine, float *stereo, size_t frames)
     std::memset(efxL, 0, n * sizeof *efxL);
     std::memset(efxR, 0, n * sizeof *efxR);
     bool sending = false;
-    for (unsigned i = 0; i < kMaxVoices; ++i) {
-      struct Voice *voice = engine->voices + i;
-      if (!voice->allocated || voice->pair_feed)
-        continue;
-      /* A voice assigned to OUTPUT1 or OUTPUT2 leaves the machine by its
-         own jacks and is not on the MIX bus the chorus and reverb return
-         to, so it is rendered - it still holds its slot and runs its
-         envelopes - and then dropped. Whether its per-voice sends survive
-         that routing is NOT established, so it sends nothing rather than
-         sending something unverified.
-
-         MEASURED EXPOSURE, before this changed anything: across all three
-         factory demo songs exactly one record asks for OUTPUT1 - tone 1 of
-         part 1 in `1080 rave` - and that part's own assign reads EFX, so
-         the part decides and the tone's OUTPUT1 never applies. No voice in
-         any of the three is affected. */
-      if (voice->destination == kOutputOne ||
-          voice->destination == kOutputTwo) {
-        std::memset(vl, 0, n * sizeof *vl);
-        std::memset(vr, 0, n * sizeof *vr);
-        if (!render_voice(voice, vl, vr, n))
-          free_voice(voice);
-        continue;
+    if (engine->pool && n >= kThreadedMinFrames) {
+      struct VoiceBatch *batch = engine->batch;
+      batch->frames = n;
+      batch->count = 0;
+      for (unsigned i = 0; i < kMaxVoices; ++i) {
+        struct Voice *voice = engine->voices + i;
+        if (!voice->allocated || voice->pair_feed)
+          continue;
+        batch->voice[batch->count] = voice;
+        batch->route[batch->count] = voice_route(engine, voice);
+        ++batch->count;
       }
-      /* A voice bound for the insert goes to the insert's own bus, but
-         only while there is an insert to go to: an effect type this engine
-         does not render leaves its voices on the mix, where they have been
-         all along, rather than dropping them into a bus nothing reads. */
-      if (voice->destination == kOutputEfx && engine->efx_ready) {
-        std::memset(vl, 0, n * sizeof *vl);
-        std::memset(vr, 0, n * sizeof *vr);
-        if (!render_voice(voice, vl, vr, n))
+      engine->pool->run(batch->count, render_batch_voice, batch);
+      for (unsigned k = 0; k < batch->count; ++k) {
+        struct Voice *voice = batch->voice[k];
+        const struct VoiceBlock *block = batch->block + k;
+        switch (batch->route[k]) {
+        case kRouteDropped:
+          break;
+        case kRouteInsert:
+          for (size_t f = 0; f < n; ++f) {
+            efxL[f] += block->left[f];
+            efxR[f] += block->right[f];
+          }
+          break;
+        case kRouteSends:
+          mix_with_sends(voice, block->left, block->right, block->unpanned,
+                         left, right, send, csend, n);
+          sending = true;
+          break;
+        case kRouteMix:
+          for (size_t f = 0; f < n; ++f) {
+            left[f] += block->left[f];
+            right[f] += block->right[f];
+          }
+          break;
+        }
+        if (!batch->alive[k])
           free_voice(voice);
-        for (size_t k = 0; k < n; ++k) {
-          efxL[k] += vl[k];
-          efxR[k] += vr[k];
-        }
-        continue;
       }
-      /* The reverb bus is live whichever shape the module has taken: the
-         tank on types 0..5, the panning delay on type 7. */
-      bool reverbLive = engine->reverb_ready || engine->delay_ready;
-      if ((reverbLive && voice->reverb_send > 0.0f) ||
-          (engine->chorus_ready && voice->chorus_send > 0.0f)) {
-        std::memset(vl, 0, n * sizeof *vl);
-        std::memset(vr, 0, n * sizeof *vr);
-        std::memset(vc, 0, n * sizeof *vc);
-        if (!render_voice(voice, vl, vr, n, vc)) {
-          free_voice(voice);
+    } else {
+      for (unsigned i = 0; i < kMaxVoices; ++i) {
+        struct Voice *voice = engine->voices + i;
+        if (!voice->allocated || voice->pair_feed)
+          continue;
+        switch (voice_route(engine, voice)) {
+        case kRouteDropped:
+          std::memset(vl, 0, n * sizeof *vl);
+          std::memset(vr, 0, n * sizeof *vr);
+          if (!render_voice(voice, vl, vr, n))
+            free_voice(voice);
+          break;
+        case kRouteInsert:
+          std::memset(vl, 0, n * sizeof *vl);
+          std::memset(vr, 0, n * sizeof *vr);
+          if (!render_voice(voice, vl, vr, n))
+            free_voice(voice);
+          for (size_t k = 0; k < n; ++k) {
+            efxL[k] += vl[k];
+            efxR[k] += vr[k];
+          }
+          break;
+        case kRouteSends:
+          std::memset(vl, 0, n * sizeof *vl);
+          std::memset(vr, 0, n * sizeof *vr);
+          std::memset(vc, 0, n * sizeof *vc);
+          if (!render_voice(voice, vl, vr, n, vc))
+            free_voice(voice);
+          mix_with_sends(voice, vl, vr, vc, left, right, send, csend, n);
+          sending = true;
+          break;
+        case kRouteMix:
+          if (!render_voice(voice, left, right, n))
+            free_voice(voice);
+          break;
         }
-        /* THE CHORUS SEND IS TAKEN BEFORE THE PAN. On the device a centred
-           voice's first chorus echo, at depth 0 and feedback 0, is 3.14 dB
-           above its own dry signal on both channels, on every depth-0 tick
-           of `chorus_fb/system_feedback_ticks` (`P-xxxx`). The pan is
-           constant-power, so a centred voice reaches each channel at
-           0.7071 of its unpanned level: a send taken before the pan
-           predicts +3.01 dB, and the post-pan mean of the two channels
-           predicts 0 dB. Only the centred case is measured; that an
-           off-centre voice sends the same is what "before the pan" means,
-           and no capture yet varies the pan with the chorus open. The
-           reverb send stays on the post-pan mean: its returns were
-           calibrated through it, and PAN-DLY's first repeat reads +2.7 dB
-           over the dry against the device's +3.0 that way. */
-        for (size_t k = 0; k < n; ++k) {
-          float mono = 0.5f * (vl[k] + vr[k]);
-          left[k] += vl[k];
-          right[k] += vr[k];
-          send[k] += voice->reverb_send * mono;
-          csend[k] += voice->chorus_send * vc[k];
-        }
-        sending = true;
-        continue;
       }
-      if (!render_voice(voice, left, right, n))
-        free_voice(voice);
     }
     for (size_t k = 0; k < n; ++k) {
       stereo[(done + k) * 2u] +=
@@ -4299,6 +4429,23 @@ void engine_render_jv(void *state, float *stereo, size_t frames)
   }
 }
 
+bool engine_set_worker_pool_jv(void *state, WorkerPool *pool)
+{
+  struct Engine *engine = (struct Engine *)state;
+  if (!engine)
+    return false;
+  engine->pool = nullptr;
+  if (!pool || pool->threads() <= 1)
+    return true;
+  if (!engine->batch) {
+    engine->batch = new (std::nothrow) struct VoiceBatch;
+    if (!engine->batch)
+      return false;
+  }
+  engine->pool = pool;
+  return true;
+}
+
 bool engine_set_max_voices_jv(void *state, unsigned maxVoices)
 {
   struct Engine *engine = (struct Engine *)state;
@@ -4340,6 +4487,7 @@ const struct XpVoiceEngineOps JV1080_VOICE_ENGINE = {
   EmuSC::Xp::engine_gm_system_on,
   EmuSC::Xp::engine_pitch_bend,
   EmuSC::Xp::engine_channel_pressure,
+  EmuSC::Xp::engine_set_worker_pool_jv,
 };
 
 }  // extern "C"

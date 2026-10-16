@@ -57,6 +57,9 @@ emuscd --device sc88 --name "My Synth"
 --rate HZ           Requested audio sample rate (default: 48000)
 --latency MS        Requested output buffer size in ms (default: 20)
 --block N           Audio frames per ALSA write (default: 256)
+--threads N         Threads the SC-88 and JV-1080 render their voices on,
+                    this one included; 0 is one per CPU the process may use
+                    (default: 0). The audio is the same at every count
 --gain-db DB        Output gain in dB, linear multiplier 10^(DB/20) applied
                     to the final samples (default: 0, no change - a
                     listening-convenience knob only, see emusc-render's

@@ -58,7 +58,7 @@
 
 // The SC-88's engine and its own device state. Forward-declared rather than
 // included so that this header does not pull in the whole engines/xp/ tree.
-namespace EmuSC { namespace Xp { struct Device; } }
+namespace EmuSC { namespace Xp { struct Device; class WorkerPool; } }
 
 namespace EmuSC {
 
@@ -101,7 +101,7 @@ public:
   // many get_next_frame() calls would return, every queued MIDI event still
   // applied at the frame it was queued for. A block lets the SC-88 and
   // JV-1080 engines run each stage over many frames per call instead of
-  // one.
+  // one, and gives set_render_threads() something to divide.
   int get_next_frames(float *out, size_t frames);
   uint32_t get_num_clipped_samples(bool reset = true);
   std::array<int, 16> get_parts_last_peak_sample(void);
@@ -121,6 +121,18 @@ public:
   // Part/Note engine re-reads this on every note, so it takes effect on
   // the very next one regardless of when it's called.
   void set_max_voices(unsigned maxVoices);
+
+  // How many threads the SC-88 and JV-1080 engines render their voices on,
+  // the calling one included. 1, the default, renders on the calling thread
+  // alone; 0 asks for one per CPU this process may run on. The output is the
+  // same bytes at every count. It takes effect for blocks rendered with
+  // get_next_frames(); get_next_frame() renders one frame at a time, which
+  // leaves nothing to divide. No effect on the other devices, or in a build
+  // without thread support (32-bit Windows), where every count means 1. Not
+  // to be called while another thread is rendering.
+  void set_render_threads(unsigned threads);
+  // The threads actually in use, which may be fewer than were asked for.
+  unsigned render_threads(void) const;
 
   void reset(SoundMap sm, bool resetParts = false);
 
@@ -206,6 +218,10 @@ private:
   // place besides set_max_voices() itself that reads it.
   bool _maxVoicesSet = false;
   unsigned _maxVoices = 0;
+
+  // set_render_threads()'s pool, kept across the XP engine's reopening by
+  // set_audio_format(); null while one thread is asked for.
+  Xp::WorkerPool *_renderPool = nullptr;
   
   uint32_t _sampleRate;
   uint8_t _channels;
