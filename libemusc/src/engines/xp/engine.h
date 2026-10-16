@@ -17,10 +17,10 @@ extern "C" {
 
 #define XP_ENGINE_NONE 0xffu
 
-/* The most frames engine_render_with_send renders one voice for between two
-   joins when it has a worker pool: more than one control period at any host
-   rate up to 64 kHz, so a segment is cut short only by a serviced period or
-   by the end of the caller's block. */
+/* The most frames engine_render_with_send renders one voice for before
+   summing: more than one control period at any host rate up to 64 kHz, so a
+   segment is cut short only by a serviced period or by the end of the
+   caller's block. */
 #define XP_ENGINE_SEGMENT_FRAMES 512u
 
 /* engine_init()'s default max_voices, absent a --max-voices override - what
@@ -275,7 +275,7 @@ struct xp_engine {
   /* Where engine_render_with_send runs its voices, or null to run them on
      the calling thread; not owned. See engine_set_worker_pool. */
   EmuSC::Xp::WorkerPool *pool;
-  /* Owned; allocated by the first engine_set_worker_pool that sets a pool. */
+  /* Owned; allocated by engine_init. */
   EmuSC::Xp::EngineSegment *segment;
 };
 
@@ -317,11 +317,9 @@ bool engine_set_max_voices(struct xp_engine *engine, unsigned max_voices);
 /* Renders the voices on `pool`'s threads from the next block on, or on the
    calling thread again when pool is null or has one thread. The output is
    the same bytes either way: each voice renders a segment into storage of
-   its own and the segments are summed in the order the single-threaded
-   loop sums them. An engine with a stage tap set renders single-threaded.
-   Returns false, leaving the engine single-threaded, if the segment storage
-   cannot be allocated. engine_init clears the pool; engine_destroy frees
-   the storage but not the pool. */
+   its own and the segments are summed in one fixed order. An engine with a
+   stage tap set renders on the calling thread. engine_init clears the pool,
+   which is not owned. */
 bool engine_set_worker_pool(struct xp_engine *engine,
                              EmuSC::Xp::WorkerPool *pool);
 void engine_set_control_service(struct xp_engine *engine,

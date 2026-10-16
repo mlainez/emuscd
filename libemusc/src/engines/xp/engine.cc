@@ -14,6 +14,9 @@ namespace EmuSC { namespace Xp {
 
 namespace {
 
+EngineSegment *newSegment();
+void deleteSegment(EngineSegment *segment);
+
 void queueNote(struct xp_engine *engine, uint8_t note)
 {
   engine->note_next_free[note] = XP_ENGINE_NONE;
@@ -851,7 +854,8 @@ bool engine_init(struct xp_engine *engine,
     engine->parts[i].tvf_controls.secondary_resonance = 64;
     engine->parts[i].portamento_control = 0xffu;
   }
-  return true;
+  engine->segment = newSegment();
+  return engine->segment != nullptr;
 }
 
 bool engine_set_max_voices(struct xp_engine *engine, unsigned max_voices)
@@ -1043,7 +1047,7 @@ void engine_destroy(struct xp_engine *engine)
     if (engine->stopping[i].active)
       renderer_component_release(engine->renderer,
                                  &engine->stopping[i].component);
-  delete engine->segment;
+  deleteSegment(engine->segment);
   std::memset(engine, 0, sizeof *engine);
 }
 
@@ -1504,9 +1508,8 @@ constexpr unsigned kSegmentVoices =
 
 }  // namespace
 
-/* One segment of the multi-threaded render: the frames from one scheduler
-   call that may service a period up to the next, or to the end of the
-   block. */
+/* One segment of the render: the frames from one scheduler call that may
+   service a period up to the next, or to the end of the block. */
 struct EngineSegment {
   struct xp_engine *engine;
   size_t frames;
@@ -1525,13 +1528,22 @@ struct EngineSegment {
 
 namespace {
 
+EngineSegment *newSegment()
+{
+  return new (std::nothrow) EngineSegment;
+}
+
+void deleteSegment(EngineSegment *segment)
+{
+  delete segment;
+}
+
 void renderSegmentVoice(void *context, unsigned v)
 {
   EngineSegment *segment = (EngineSegment *)context;
   const struct xp_engine *engine = segment->engine;
   float *gained = segment->gained[v];
-  /* Nothing reads a threaded voice's taps: a tapped engine is never
-     threaded. */
+  /* Nothing reads these: a tapped engine renders frame by frame. */
   struct FrameTaps taps = {};
   size_t f = 0;
   if (v < segment->slotCount) {
@@ -1552,7 +1564,12 @@ void renderSegmentVoice(void *context, unsigned v)
   segment->end[v] = f;
 }
 
-void renderThreaded(struct xp_engine *engine, float *stereo, float *send,
+/* Each voice through a whole segment before the next voice, rather than
+   every voice through one frame before the next frame: the same arithmetic
+   in the same order per voice, with each voice's state kept in cache for
+   the length of the segment. That is worth a tenth of the SC-88's time on
+   one core, and it is what lets the voices be spread across a pool. */
+void renderSegments(struct xp_engine *engine, float *stereo, float *send,
                     float *chorusSend, float *delaySend, size_t frames,
                     double fractionStep)
 {
@@ -1601,7 +1618,11 @@ void renderThreaded(struct xp_engine *engine, float *stereo, float *send,
       ++count;
     }
 
-    engine->pool->run(count, renderSegmentVoice, segment);
+    if (engine->pool)
+      engine->pool->run(count, renderSegmentVoice, segment);
+    else
+      for (unsigned v = 0; v < count; ++v)
+        renderSegmentVoice(segment, v);
 
     for (size_t f = 0; f < n; ++f) {
       struct FrameMix mix = {};
@@ -1610,9 +1631,9 @@ void renderThreaded(struct xp_engine *engine, float *stereo, float *send,
           mixVoice(&mix, segment->buses + v, segment->gained[v][f]);
       storeFrame(&mix, stereo, send, chorusSend, delaySend, done + f);
     }
-    /* The voices that ran out, handed back in the order the
-       single-threaded loop hands them back: by frame, and within a frame
-       the slots before the stopping voices, each ascending. */
+    /* The voices that ran out, handed back in the order the frame loop
+       below hands them back: by frame, and within a frame the slots before
+       the stopping voices, each ascending. */
     for (size_t f = 0; f < n; ++f)
       for (unsigned v = 0; v < count; ++v) {
         if (segment->end[v] != f)
@@ -1633,15 +1654,7 @@ bool engine_set_worker_pool(struct xp_engine *engine,
 {
   if (!engine)
     return false;
-  engine->pool = nullptr;
-  if (!pool || pool->threads() <= 1)
-    return true;
-  if (!engine->segment) {
-    engine->segment = new (std::nothrow) EngineSegment;
-    if (!engine->segment)
-      return false;
-  }
-  engine->pool = pool;
+  engine->pool = pool && pool->threads() > 1 ? pool : nullptr;
   return true;
 }
 
@@ -1660,11 +1673,15 @@ void engine_render_with_send(struct xp_engine *engine, float *stereo,
   const bool tapped = engine->stage_taps.oscillator ||
     engine->stage_taps.after_tvf || engine->stage_taps.after_static ||
     engine->stage_taps.after_tva || engine->stage_taps.after_lfo;
-  if (engine->pool && !tapped) {
-    renderThreaded(engine, stereo, send, chorusSend, delaySend, frames,
+  if (!tapped) {
+    renderSegments(engine, stereo, send, chorusSend, delaySend, frames,
                    fractionStep);
     return;
   }
+  /* The stage-tap probe reads every voice's stages summed per frame, so a
+     tapped engine renders a frame at a time. The arithmetic is the
+     segments' own, in the same order: the two loops produce the same
+     bytes. */
   for (size_t frame = 0; frame < frames; ++frame) {
     struct FrameMix mix = {};
     struct FrameTaps taps = {};

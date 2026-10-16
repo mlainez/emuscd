@@ -166,38 +166,56 @@ void test_held_raw(char **paths)
   free(control);
 }
 
-/* A device whose voices render on a worker pool produces the same bytes as
-   one rendering them on the calling thread: overlapping notes on three
-   channels at different velocities, so every frame sums voices of different
-   levels and an out-of-order sum shows; blocks of uneven length, so
-   segments end mid-period and voices run out mid-segment; and a four-voice ceiling, so
-   notes steal slots and their voices ramp out on the stopping list. */
-void test_threaded_render_matches(const uint8_t *control,
-                                  const uint8_t *const chips[],
-                                  const size_t sizes[])
+/* The three ways the engine can run its voices give the same bytes: frame
+   by frame (what a stage tap forces), a segment at a time on the calling
+   thread, and a segment at a time on a worker pool. The notes overlap on
+   three channels at different velocities, so every frame sums voices of
+   different levels and an out-of-order sum shows; the blocks are of uneven
+   length, so segments end mid-period and voices run out mid-segment; and
+   a four-voice ceiling makes notes steal slots and their voices ramp out
+   on the stopping list. */
+void test_render_paths_match(const uint8_t *control,
+                             const uint8_t *const chips[],
+                             const size_t sizes[])
 {
   static const size_t blocks[] = {1, 37, 300, 1000, 5, 257, 2048, 64, 999};
-  EmuSC::Xp::Device serial, threaded;
+  static float framedOut[2 * 2048], segmentedOut[2 * 2048];
+  static float threadedOut[2 * 2048], tap[2048];
+  EmuSC::Xp::Device framed, segmented, threaded;
+  EmuSC::Xp::Device *all[3] = {&framed, &segmented, &threaded};
   EmuSC::Xp::WorkerPool pool(4);
-  float a[2 * 2048], b[2 * 2048];
-  unsigned note = 0;
-  assert(EmuSC::Xp::device_init_decoded(&serial, control, XP_CONTROL_ROM_SIZE,
-                                        chips, sizes, 32000.0,
-                                        XP_WRAP_FULL_CARRY));
-  assert(EmuSC::Xp::device_init_decoded(&threaded, control,
-                                        XP_CONTROL_ROM_SIZE, chips, sizes,
-                                        32000.0, XP_WRAP_FULL_CARRY));
+  for (EmuSC::Xp::Device *d : all) {
+    assert(EmuSC::Xp::device_init_decoded(d, control, XP_CONTROL_ROM_SIZE,
+                                          chips, sizes, 32000.0,
+                                          XP_WRAP_FULL_CARRY));
+    assert(EmuSC::Xp::device_set_max_voices(d, 4));
+  }
+  struct xp_engine_stage_taps taps = {};
+  taps.oscillator = tap;
+  EmuSC::Xp::engine_set_stage_taps(&framed.engine, &taps);
   assert(EmuSC::Xp::device_set_worker_pool(&threaded, &pool));
   assert((threaded.engine.pool != nullptr) == (pool.threads() > 1));
-  EmuSC::Xp::Device *both[2] = {&serial, &threaded};
-  for (EmuSC::Xp::Device *d : both)
-    assert(EmuSC::Xp::device_set_max_voices(d, 4));
   unsigned sounded = 0;
+  auto render_all = [&](size_t frames) {
+    EmuSC::Xp::device_render(&framed, framedOut, frames);
+    EmuSC::Xp::device_render(&segmented, segmentedOut, frames);
+    EmuSC::Xp::device_render(&threaded, threadedOut, frames);
+    assert(std::memcmp(framedOut, segmentedOut,
+                       frames * 2 * sizeof *framedOut) == 0);
+    assert(std::memcmp(framedOut, threadedOut,
+                       frames * 2 * sizeof *framedOut) == 0);
+    unsigned slots = EmuSC::Xp::engine_active_slots(&framed.engine);
+    assert(EmuSC::Xp::engine_active_slots(&segmented.engine) == slots);
+    assert(EmuSC::Xp::engine_active_slots(&threaded.engine) == slots);
+    for (size_t i = 0; i < frames * 2; ++i)
+      sounded += framedOut[i] != 0.0f;
+  };
+  unsigned note = 0;
   for (unsigned round = 0; round < 6; ++round)
     for (size_t frames : blocks) {
       uint8_t ch = (uint8_t)(note % 3);
       uint8_t key = (uint8_t)(48 + (note * 7) % 24);
-      for (EmuSC::Xp::Device *d : both) {
+      for (EmuSC::Xp::Device *d : all) {
         EmuSC::Xp::device_midi(d, 0, (uint8_t)(0x90 | ch), key,
                                (uint8_t)(60 + (note * 13) % 67));
         if (note >= 2)
@@ -205,47 +223,32 @@ void test_threaded_render_matches(const uint8_t *control,
                                  (uint8_t)(48 + ((note - 2) * 7) % 24), 64);
       }
       ++note;
-      EmuSC::Xp::device_render(&serial, a, frames);
-      EmuSC::Xp::device_render(&threaded, b, frames);
-      assert(std::memcmp(a, b, frames * 2 * sizeof *a) == 0);
-      assert(EmuSC::Xp::engine_active_slots(&serial.engine) ==
-             EmuSC::Xp::engine_active_slots(&threaded.engine));
-      for (size_t i = 0; i < frames * 2; ++i)
-        sounded += a[i] != 0.0f;
+      render_all(frames);
     }
   assert(sounded > 0);
   /* Three voices of one pitch struck together run out on the same frame of
      a segment, and the free list takes their slots back in the order the
-     single-threaded loop frees them - which decides which slot the next
-     three notes get, and so the order three different levels are summed
-     in. */
-  for (EmuSC::Xp::Device *d : both)
+     frame loop frees them - which decides which slot the next three notes
+     get, and so the order three different levels are summed in. */
+  for (EmuSC::Xp::Device *d : all)
     EmuSC::Xp::device_midi(d, 0, 0xb0, 123, 0);
-  for (unsigned i = 0; i < 4; ++i) {
-    EmuSC::Xp::device_render(&serial, a, 2048);
-    EmuSC::Xp::device_render(&threaded, b, 2048);
-    assert(std::memcmp(a, b, sizeof a) == 0);
-  }
+  for (unsigned i = 0; i < 4; ++i)
+    render_all(2048);
   for (unsigned chord = 0; chord < 4; ++chord) {
-    for (EmuSC::Xp::Device *d : both)
+    for (EmuSC::Xp::Device *d : all)
       for (uint8_t ch = 0; ch < 3; ++ch)
         EmuSC::Xp::device_midi(d, 0, (uint8_t)(0x90 | ch),
                                (uint8_t)(50 + chord * 5),
                                (uint8_t)(127 - 40 * ch - chord));
-    for (unsigned i = 0; i < 6; ++i) {
-      EmuSC::Xp::device_render(&serial, a, 997);
-      EmuSC::Xp::device_render(&threaded, b, 997);
-      assert(std::memcmp(a, b, 997 * 2 * sizeof *a) == 0);
-    }
+    for (unsigned i = 0; i < 6; ++i)
+      render_all(997);
   }
-  /* Detached, it renders on the calling thread again, still in step. */
+  /* Detached, the pool's device renders on the calling thread, in step. */
   assert(EmuSC::Xp::device_set_worker_pool(&threaded, nullptr));
   assert(threaded.engine.pool == nullptr);
-  EmuSC::Xp::device_render(&serial, a, 2048);
-  EmuSC::Xp::device_render(&threaded, b, 2048);
-  assert(std::memcmp(a, b, sizeof a) == 0);
-  EmuSC::Xp::device_destroy(&serial);
-  EmuSC::Xp::device_destroy(&threaded);
+  render_all(2048);
+  for (EmuSC::Xp::Device *d : all)
+    EmuSC::Xp::device_destroy(d);
 }
 
 }  // namespace
@@ -266,7 +269,7 @@ int main(void)
   make_control(control);
   chip[0x8000] = 1;
   chip[0x8001] = 1;
-  test_threaded_render_matches(control, chips, sizes);
+  test_render_paths_match(control, chips, sizes);
   assert(EmuSC::Xp::device_init_decoded(&device, control, XP_CONTROL_ROM_SIZE,
                                         chips, sizes, 32000.0,
                                         XP_WRAP_FULL_CARRY));
