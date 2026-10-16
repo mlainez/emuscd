@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <iostream>
 #include <string>
+#include <cerrno>
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
@@ -15,6 +16,9 @@
 #include <mutex>
 #include <vector>
 #include <alsa/asoundlib.h>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/mman.h>
 #include "common.h"
 #include "../libemusc/src/synth.h"
 #include "../libemusc/src/control_rom.h"
@@ -400,6 +404,7 @@ int main(int argc, char* argv[]) {
   unsigned int threads = 0;
   std::vector<unsigned> cpus;
   bool stats = false;
+  int rt_priority = 0;
   double gain_db = 0.0;
 
   for (int i = 1; i < argc; i++) {
@@ -442,6 +447,12 @@ int main(int argc, char* argv[]) {
       }
     } else if (arg == "--stats") {
       stats = true;
+    } else if (arg == "--rt") {
+      rt_priority = std::stoi(need("--rt"));
+      if (rt_priority < 1 || rt_priority > 99) {
+        std::cerr << "emuscd: --rt takes a priority from 1 to 99" << std::endl;
+        return 1;
+      }
     } else if (arg == "--gain-db") {
       gain_db = std::stod(need("--gain-db"));
     } else if (arg == "--help" || arg == "-h") {
@@ -471,6 +482,10 @@ int main(int argc, char* argv[]) {
           << "                       Without --threads, one thread per CPU listed\n"
           << "  --stats             Every 5 s on stderr: render time per block as\n"
           << "                       a share of its playing time (avg, p99, max)\n"
+          << "  --rt PRIO           Run the render threads SCHED_FIFO at PRIO (1-99)\n"
+          << "                       with memory locked, so a block's render is not\n"
+          << "                       preempted by ordinary processes or page faults.\n"
+          << "                       Needs CAP_SYS_NICE (root)\n"
           << "  --gain-db DB        Output gain in dB, linear multiplier 10^(DB/20)\n"
           << "                       applied to the final samples (default: 0, no\n"
           << "                       change - a listening-convenience knob only)\n"
@@ -502,6 +517,20 @@ int main(int argc, char* argv[]) {
     worker_cpus = emusc_tools::worker_cpus(cpus);
     if (!emusc_tools::pin_this_thread(cpus[0]))
       std::cerr << "emuscd: cannot pin to CPU " << cpus[0] << std::endl;
+  }
+
+  // Before the synth exists, so that the render pool's threads, created
+  // with it, inherit the policy: glibc's threads take their creator's.
+  if (rt_priority) {
+    sched_param param{};
+    param.sched_priority = rt_priority;
+    int err = pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+    if (err != 0)
+      std::cerr << "emuscd: cannot set SCHED_FIFO " << rt_priority << ": "
+                << std::strerror(err) << std::endl;
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
+      std::cerr << "emuscd: cannot lock memory: " << std::strerror(errno)
+                << std::endl;
   }
 
   try {
