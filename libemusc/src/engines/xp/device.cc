@@ -378,6 +378,16 @@ bool sysexWrite(Device *device, uint8_t port, uint32_t address,
     if (value > 1)
       return false;
     device->system_mode = value;
+    /* @provenance class=DOCUMENTED devices=SC-88
+       "The operating mode will be set, and at the same time all internal
+       parameters (except for the map settings of each Part) will be reset
+       to the initial state" (om-128). The SC-88's own demo songs open with
+       it in place of a GS reset. Only the voice side of that reset is done
+       here, the cut the GS reset makes; the parameter reset is not, since
+       the demos send settings ahead of it that a reset would clear, and
+       which of them the device keeps is not established. */
+    for (unsigned part = 0; part < XP_ENGINE_PART_COUNT; ++part)
+      engine_all_sound_off(&device->engine, (uint8_t)part);
     return true;
   }
   if (address == 0x40007f) {
@@ -742,6 +752,16 @@ void device_reset_controllers(Device *device)
       device->channels[part] = ChannelState();
     return;
   }
+  /* @provenance class=UNVERIFIED devices=SC-88
+     The reset cuts every part's voices before restoring the defaults, as
+     the shared Part/Note engine's reset does for the SC-55 family and as
+     the JV-1080's GM System On does from its firmware. Neither the SC-88's
+     manual nor its traced firmware says what a GS reset does to notes
+     still sounding. Left sounding, notes a song never released (a player
+     stopped mid-song) were brought back to full level by the next song's
+     reset and held for good. */
+  for (unsigned part = 0; part < XP_ENGINE_PART_COUNT; ++part)
+    engine_all_sound_off(&device->engine, (uint8_t)part);
   device->master_volume = 127;
   device->secondary_level = 127;
   device->master_pan = 64;
