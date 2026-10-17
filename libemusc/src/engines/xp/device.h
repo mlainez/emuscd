@@ -250,6 +250,12 @@ bool device_set_max_voices(Device *device, unsigned maxVoices);
  * pool. The pool is not owned and must outlive the device or be detached
  * first. */
 bool device_set_worker_pool(Device *device, WorkerPool *pool);
+/* The host's panic, the same on every device and not a MIDI message: every
+ * part's voices cut, its pedals released and its controllers reset as its
+ * own Reset All Controllers would, whatever its receive channel and
+ * whichever channel-mode messages the device recognises. Programs, patches
+ * and effects stay as they are. */
+void device_panic(Device *device);
 void device_set_master_volume(Device *device, uint8_t value);
 void device_set_master_pan(Device *device, uint8_t value);
 

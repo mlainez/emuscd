@@ -16,6 +16,7 @@
 #include <mutex>
 #include <vector>
 #include <alsa/asoundlib.h>
+#include <csignal>
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
@@ -92,6 +93,12 @@ public:
   }
 };
 
+// Set by SIGUSR1; the render loop takes it, since a signal handler may do
+// nothing but store to a lock-free atomic.
+std::atomic<bool> panic_signalled{false};
+
+void on_sigusr1(int) { panic_signalled = true; }
+
 class EmuscdDaemon {
   snd_seq_t* seq = nullptr;
   int seq_port = -1;
@@ -111,6 +118,7 @@ class EmuscdDaemon {
 
   std::atomic<bool> running{true};
   std::atomic<bool> device_change_requested{false};
+  std::atomic<bool> panic_requested{false};
   std::mutex request_mutex;
   std::string requested_device;
 
@@ -263,10 +271,19 @@ public:
     RenderStats stats;
     const double period_s = (double) block_frames / sample_rate;
     std::cout << "emuscd daemon running (device: " << device_name << "). "
-              << "Type a device name to switch, or 'quit' to exit."
+              << "Type a device name to switch, 'panic' to silence it "
+              << "(or send SIGUSR1), or 'quit' to exit."
               << std::endl;
 
     while (running) {
+      // Between blocks, on this thread: the one panic every device obeys,
+      // whatever MIDI it recognises.
+      if ((panic_requested.exchange(false) | panic_signalled.exchange(false)) &&
+          synth) {
+        synth->panic();
+        std::cout << "emuscd: panic" << std::endl;
+      }
+
       if (device_change_requested.exchange(false)) {
         std::string dev;
         {
@@ -377,6 +394,8 @@ private:
       if (std::getline(std::cin, line)) {
         if (line == "quit" || line == "exit") {
           running = false;
+        } else if (line == "panic") {
+          panic_requested = true;
         } else if (!line.empty()) {
           std::lock_guard<std::mutex> lock(request_mutex);
           requested_device = line;
@@ -491,6 +510,9 @@ int main(int argc, char* argv[]) {
           << "                       change - a listening-convenience knob only)\n"
           << "  --help              Show this help\n"
           << "\n"
+          << "On stdin: a device name switches device, 'panic' (or SIGUSR1)\n"
+          << "silences every part of any device, 'quit' exits.\n"
+          << "\n"
           << "ROM files are named <device>_control.bin, <device>_cpu.bin\n"
           << "(SC-55/SC-55mkII only) and <device>_waverom<N>.bin. See\n"
           << "README.md for exact ROM hashes.\n";
@@ -508,6 +530,8 @@ int main(int argc, char* argv[]) {
   }
 
   if (rom_dir.empty()) rom_dir = default_rom_dir();
+
+  std::signal(SIGUSR1, on_sigusr1);
 
   // The first CPU listed takes this thread, which renders and also drives
   // ALSA; the pool's threads take the rest from the last down.

@@ -116,7 +116,27 @@ const DeviceProfile SC55MKII_PROFILE = {
 
   // This generation carries a 2 MB wave ROM, so bank id 2 lands a megabyte
   // further up than on the mk1.
-  { false, 0x200000 }
+  { false, 0x200000 },
+
+  // Written out only to reach the protocol flags below; each is the value an
+  // omitted member gets.
+  {},     // tvfLawKind
+  {},     // tvfJv
+  {},     // chorusLawKind
+  {},     // chorusJv
+  {},     // pitchJv
+  {},     // analog
+  {},     // ctrlJv
+  false,  // variationFallback
+  false,  // rolandSysExOnly
+  false,  // gsScaleTuningOnly
+  false,  // ignoresAllSoundOff
+
+  // @provenance class=DOCUMENTED devices=SC-55mkII
+  // Owner's manual p.92: "MONO is recognized as 'all sounds off'" and "POLY
+  // is recognized as 'all sounds off'". The mk1's manual (p.76) has both as
+  // "all notes off", so this is the mkII's own.
+  true    // monoPolyCutSound
 };
 
 }

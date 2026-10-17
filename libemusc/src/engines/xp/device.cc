@@ -894,6 +894,22 @@ bool device_set_worker_pool(Device *device, WorkerPool *pool)
   return engine_set_worker_pool(&device->engine, pool);
 }
 
+void device_panic(Device *device)
+{
+  if (!device || !device->initialized)
+    return;
+  if (device->voice_ops) {
+    if (device->voice_ops->panic)
+      device->voice_ops->panic(device->voice_state);
+    return;
+  }
+  for (unsigned part = 0; part < XP_ENGINE_PART_COUNT; ++part) {
+    engine_all_sound_off(&device->engine, (uint8_t)part);
+    (void)device_midi(device, (uint8_t)(part / 16u),
+                      (uint8_t)(0xb0u | (part % 16u)), 121, 0);
+  }
+}
+
 void device_set_master_volume(Device *device, uint8_t value)
 {
   if (!device || !device->initialized || value > 127)
@@ -1084,11 +1100,33 @@ bool device_midi(Device *device, uint8_t port, uint8_t status,
       state->portamento_control = data2;
       engine_set_part_portamento_control(&device->engine, part, data2);
       return true;
+    /* @provenance class=FW-EXACT devices=SC-88 ref=0x127b8,0x352d,0x3611,0x361c,0x362e
+       The controller table at 0x127b8 sends 120 to 0x352d, 123..125 to
+       0x3611, 126 to 0x361c and 127 to 0x362e, and each acts only on a
+       value of 0 (`tst r0; bne`). 126 and 127 set the part's mode bit and
+       then run the 120 handler: All Sound Off with the mode change, as the
+       manual has it (om-127). */
+    case 120:
+      if (data2 == 0)
+        engine_all_sound_off(&device->engine, part);
+      return true;
+    case 123:
+    case 124:
+    case 125:
+      if (data2 == 0)
+        engine_all_notes_off(&device->engine, part);
+      return true;
     case 126:
-      state->mono_mode = 0;
+      if (data2 == 0) {
+        state->mono_mode = 0;
+        engine_all_sound_off(&device->engine, part);
+      }
       return true;
     case 127:
-      state->mono_mode = 1;
+      if (data2 == 0) {
+        state->mono_mode = 1;
+        engine_all_sound_off(&device->engine, part);
+      }
       return true;
     case 93:
       state->chorus_send = data2;
@@ -1223,9 +1261,19 @@ bool device_midi(Device *device, uint8_t port, uint8_t status,
       state->nrpn_lsb = 127;
       return true;
     case 121:
+      /* @provenance class=DOCUMENTED devices=SC-88
+         The manual's Reset All Controllers list (om-127): pitch bend
+         centre, polyphonic and channel pressure 0, modulation 0, expression
+         127, Hold 1, portamento, sostenuto and soft 0, RPN and NRPN
+         unset with their data unchanged. */
       state->expression = 127;
       state->hold1 = 0;
       state->pitch_bend = 8192;
+      state->modulation = 0;
+      state->channel_pressure = 0;
+      state->portamento_switch = 0;
+      engine_set_part_portamento(&device->engine, part, false);
+      syncLfo1PitchDepth(device, part);
       state->rpn_msb = 127;
       state->rpn_lsb = 127;
       state->nrpn_msb = 127;

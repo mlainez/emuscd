@@ -1194,14 +1194,16 @@ void Synth::panic(void)
   midiMutex.lock();
   _eventQueue.clear();
   if (_xpDevice)
-    Xp::device_reset_controllers(_xpDevice);
+    Xp::device_panic(_xpDevice);
   midiMutex.unlock();
 
   if (_xpDevice)
     return;
 
-  for (auto &p : _parts)
+  for (auto &p : _parts) {
     p.delete_all_notes();
+    p.control_change(121, 0);
+  }
 }
 
 
@@ -1483,9 +1485,11 @@ void Synth::_midi_input_sysex_DT1(uint8_t model, uint8_t *data, uint16_t length)
     // System parameters
     if (data[0] == 0x40 && data[1] == 0x00) {
 
-      // First handle the special case: Reset to the GSstandard mode message
+      // First handle the special case: Reset to the GSstandard mode message,
+      // "ignored when 'Rx.GS Reset : Off'" (SC-55mkII OM p.93).
       if (data[2] == 0x7f) {
-	reset(SoundMap::GS, true);
+	if (_settings->get_param(SystemParam::RxGSReset))
+	  reset(SoundMap::GS, true);
 	return;
       }
 
