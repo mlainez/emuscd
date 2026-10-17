@@ -1245,9 +1245,19 @@ bool device_midi(Device *device, uint8_t port, uint8_t status,
       state->nrpn_lsb = 127;
       return true;
     case 121:
+      /* @provenance class=DOCUMENTED devices=SC-88
+         The manual's Reset All Controllers list (om-127): pitch bend
+         centre, polyphonic and channel pressure 0, modulation 0, expression
+         127, Hold 1, portamento, sostenuto and soft 0, RPN and NRPN
+         unset with their data unchanged. */
       state->expression = 127;
       state->hold1 = 0;
       state->pitch_bend = 8192;
+      state->modulation = 0;
+      state->channel_pressure = 0;
+      state->portamento_switch = 0;
+      engine_set_part_portamento(&device->engine, part, false);
+      syncLfo1PitchDepth(device, part);
       state->rpn_msb = 127;
       state->rpn_lsb = 127;
       state->nrpn_msb = 127;
