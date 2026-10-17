@@ -1084,11 +1084,33 @@ bool device_midi(Device *device, uint8_t port, uint8_t status,
       state->portamento_control = data2;
       engine_set_part_portamento_control(&device->engine, part, data2);
       return true;
+    /* @provenance class=FW-EXACT devices=SC-88 ref=0x127b8,0x352d,0x3611,0x361c,0x362e
+       The controller table at 0x127b8 sends 120 to 0x352d, 123..125 to
+       0x3611, 126 to 0x361c and 127 to 0x362e, and each acts only on a
+       value of 0 (`tst r0; bne`). 126 and 127 set the part's mode bit and
+       then run the 120 handler: All Sound Off with the mode change, as the
+       manual has it (om-127). */
+    case 120:
+      if (data2 == 0)
+        engine_all_sound_off(&device->engine, part);
+      return true;
+    case 123:
+    case 124:
+    case 125:
+      if (data2 == 0)
+        engine_all_notes_off(&device->engine, part);
+      return true;
     case 126:
-      state->mono_mode = 0;
+      if (data2 == 0) {
+        state->mono_mode = 0;
+        engine_all_sound_off(&device->engine, part);
+      }
       return true;
     case 127:
-      state->mono_mode = 1;
+      if (data2 == 0) {
+        state->mono_mode = 1;
+        engine_all_sound_off(&device->engine, part);
+      }
       return true;
     case 93:
       state->chorus_send = data2;

@@ -370,6 +370,14 @@ void engine_hold(struct xp_engine *engine, uint8_t part, bool enabled);
 void engine_hold_value(struct xp_engine *engine, uint8_t part,
                         uint8_t value);
 void engine_sostenuto(struct xp_engine *engine, uint8_t part, bool enabled);
+/* ALL NOTES OFF: every key still down on the part goes through the same
+   transition its own note-off would, so Hold 1 and sostenuto keep a note
+   sounding exactly as they keep a released key. */
+void engine_all_notes_off(struct xp_engine *engine, uint8_t part);
+/* ALL SOUND OFF: every note on the part is reclaimed at once - its voices
+   handed to the stop ramp a stolen voice takes, its slots freed - and
+   sostenuto is switched off. */
+void engine_all_sound_off(struct xp_engine *engine, uint8_t part);
 
 unsigned engine_active_slots(const struct xp_engine *engine);
 unsigned engine_released_slots(const struct xp_engine *engine);

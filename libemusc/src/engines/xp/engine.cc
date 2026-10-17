@@ -1209,6 +1209,29 @@ bool engine_note_on(struct xp_engine *engine, uint8_t part,
   return true;
 }
 
+namespace {
+
+/* The note-off transition (`0x203a`) for one note whose key is down. */
+void noteKeyOff(struct xp_engine *engine, uint8_t noteIndex)
+{
+  struct xp_engine_note *note = engine->notes + noteIndex;
+  const struct xp_engine_part *part = engine->parts + note->part;
+  /* A note the kit exempts is left sounding: the key is no longer down but
+     nothing is released, so the sample and its envelope run to their end. */
+  if (note->ignore_note_off) {
+    note->key_down = false;
+    return;
+  }
+  note->key_down = false;
+  note->hold_retained = part->hold;
+  note->sostenuto_retained = part->sostenuto &&
+    (part->sostenuto_keys[note->key >> 3] &
+     (uint8_t)(1u << (note->key & 7))) != 0;
+  startRelease(engine, noteIndex);
+}
+
+}  // namespace
+
 bool engine_note_off(struct xp_engine *engine, uint8_t part, uint8_t key)
 {
   uint8_t candidate = XP_ENGINE_NONE;
@@ -1223,23 +1246,57 @@ bool engine_note_off(struct xp_engine *engine, uint8_t part, uint8_t key)
       serial = note->serial;
     }
   }
-  /* A note the kit exempts is left sounding: the key is no longer down but
-     nothing is released, so the sample and its envelope run to their end. */
-  if (candidate != XP_ENGINE_NONE &&
-      engine->notes[candidate].ignore_note_off) {
-    engine->notes[candidate].key_down = false;
-    return true;
-  }
   if (candidate == XP_ENGINE_NONE)
     return false;
-  engine->notes[candidate].key_down = false;
-  engine->notes[candidate].hold_retained = engine->parts[part].hold;
-  engine->notes[candidate].sostenuto_retained =
-    engine->parts[part].sostenuto &&
-    (engine->parts[part].sostenuto_keys[key >> 3] &
-     (uint8_t)(1u << (key & 7))) != 0;
-  startRelease(engine, candidate);
+  noteKeyOff(engine, candidate);
   return true;
+}
+
+/* @provenance class=FW-EXACT devices=SC-88 ref=0x3611,0x201f
+   CC123 (and CC124/125, the same handler) queues event 0x1a, whose handler
+   walks the part's notes and sends each one with its key-down bit set
+   through `0x203a`, the transition an ordinary note-off uses - so the
+   retain bits for Hold 1 and sostenuto are set there as for any note-off.
+   The manual says the same (om-127). */
+void engine_all_notes_off(struct xp_engine *engine, uint8_t part)
+{
+  if (!engine || part >= XP_ENGINE_PART_COUNT)
+    return;
+  for (unsigned i = 0; i < XP_ENGINE_NOTE_COUNT; ++i) {
+    const struct xp_engine_note *note = engine->notes + i;
+    if (note->allocated && note->key_down && note->part == part)
+      noteKeyOff(engine, (uint8_t)i);
+  }
+}
+
+/* @provenance class=FW-EXACT devices=SC-88 ref=0x352d,0x1e80,0x23dd
+   CC120 queues event 0x20, whose handler reclaims every note of the part
+   (`0x23dd`, a loop over `0x2322`) rather than releasing it, then switches
+   sostenuto off (`0x1f90`) and clears the pressed-key bitmap. The manual:
+   "turned off immediately" (om-127). A reclaimed voice takes the stop ramp
+   the voice allocator gives a stolen one, as reclaimSlots does. */
+void engine_all_sound_off(struct xp_engine *engine, uint8_t part)
+{
+  if (!engine || part >= XP_ENGINE_PART_COUNT)
+    return;
+  for (unsigned i = 0; i < XP_ENGINE_NOTE_COUNT; ++i) {
+    struct xp_engine_note *note = engine->notes + i;
+    if (!note->allocated || note->part != part)
+      continue;
+    uint8_t slots[XP_MAX_TONE_COMPONENTS];
+    std::memcpy(slots, note->slots, sizeof slots);
+    for (unsigned k = 0; k < XP_MAX_TONE_COMPONENTS; ++k) {
+      if (slots[k] == XP_ENGINE_NONE)
+        continue;
+      stopVoice(engine, slots[k]);
+      freeSlot(engine, slots[k], false);
+    }
+    /* A note with no slot left (every component already run out) is
+       freed by its last freeSlot; one that never had a slot is freed
+       here. */
+    freeNoteIfEmpty(engine, (uint8_t)i);
+  }
+  engine_sostenuto(engine, part, false);
 }
 
 void engine_hold(struct xp_engine *engine, uint8_t part, bool enabled)
