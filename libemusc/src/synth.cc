@@ -205,8 +205,8 @@ void Synth::reset(SoundMap sm, bool resetParts)
   // The SC-88 holds its state in its own engine and leaves _parts empty for
   // its whole life, so the loop below reaches none of it. This is the call
   // Xp::device_sysex() makes for the GS reset address 40 00 7F, so a host
-  // reset and a GS reset leave the device in the same state: controllers and
-  // parameters back to their defaults, voices already sounding left alone.
+  // reset and a GS reset leave the device in the same state: every voice
+  // cut, controllers and parameters back to their defaults.
   // It returns without doing anything on a device that is not yet
   // initialized, which is what a Synth holds until set_audio_format().
   //
