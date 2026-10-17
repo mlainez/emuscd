@@ -842,7 +842,8 @@ int Part::control_change(uint8_t msgId, uint8_t value)
 
   // Channel Mode messages
   } else if (msgId == 120) {                           // All Sounds Off
-    delete_all_notes();
+    if (!_ctrlRom.profile()->ignoresAllSoundOff)
+      delete_all_notes();
 
   } else if (msgId == 121) {                           // Reset All Controllers
     pitch_bend_change(0x00, 0x40, true);
@@ -855,7 +856,22 @@ int Part::control_change(uint8_t msgId, uint8_t value)
     _settings->set_param(PatchParam::Portamento, 0, (int8_t) _id);
     _settings->set_param(PatchParam::Sostenuto, 0, (int8_t) _id);
     _settings->set_param(PatchParam::Soft, 0, (int8_t) _id);
-    // RPN & NRPN LSB/MSB -> 0x7f?
+    // Hold 1 and Sostenuto off are pedal releases, not just new values: a
+    // note the pedal was keeping after its note-off is released here, as
+    // the pedal's own off would release it.
+    {
+      const std::scoped_lock lock(*_notesMutex);
+      for (auto &n : _notes)
+        n->sustain(false);
+    }
+    // @provenance class=DOCUMENTED devices=SC-55,SC-55mkII
+    // "RPN / NRPN: No specified parameter, value is no change" (SC-55 OM
+    // p.76; the mkII's p.92 says the same): the selectors are cleared and the
+    // values they last wrote stay.
+    _settings->set_param(PatchParam::RPN_MSB, (uint8_t) 0x7f, (int8_t) _id);
+    _settings->set_param(PatchParam::RPN_LSB, (uint8_t) 0x7f, (int8_t) _id);
+    _settings->set_param(PatchParam::NRPN_MSB, (uint8_t) 0x7f, (int8_t) _id);
+    _settings->set_param(PatchParam::NRPN_LSB, (uint8_t) 0x7f, (int8_t) _id);
 
   } else if (msgId == 123) {                           // All Notes Off
     stop_all_notes();
@@ -867,11 +883,17 @@ int Part::control_change(uint8_t msgId, uint8_t value)
     stop_all_notes();
 
   } else if (msgId == 126) {                           // Mono (-> Mode 4)
-    stop_all_notes();
+    if (_ctrlRom.profile()->monoPolyCutSound)
+      delete_all_notes();
+    else
+      stop_all_notes();
     _settings->set_param(PatchParam::PolyMode, (uint8_t) 0, (int8_t) _id);
 
   } else if (msgId == 127) {                           // Poly (-> Mode 3)
-    stop_all_notes();
+    if (_ctrlRom.profile()->monoPolyCutSound)
+      delete_all_notes();
+    else
+      stop_all_notes();
     _settings->set_param(PatchParam::PolyMode, (uint8_t) 1, (int8_t) _id);
   }
 

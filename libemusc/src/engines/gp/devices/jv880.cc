@@ -1142,7 +1142,13 @@ const DeviceProfile JV880_PROFILE = {
   // takes the 12 bytes (0x2F82B-0x2F837). Every other GS DT1 - the GS Reset
   // 40 00 7F, the reverb/chorus block 40 01 xx, the part blocks 40 1x yy with
   // yy != 40 - fails one of those tests and is dropped.
-  true    // gsScaleTuningOnly
+  true,   // gsScaleTuningOnly
+
+  // @provenance class=FW-EXACT devices=JV-880 ref=ROM1:0x73F4,ROM1:0x74EA
+  // CC120 takes slot 0 of the controller table at ROM1 0x73F4, whose handler
+  // at 0x74EA is a bare rts. The owner's manual agrees: its implementation
+  // chart (p.10-43) and channel mode list (p.10-34) have no All Sound Off.
+  true    // ignoresAllSoundOff
 };
 
 }

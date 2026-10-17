@@ -1157,6 +1157,16 @@ struct DeviceProfile
   // ((x - 1) & 7), so x = 0 is the eighth part. Omitted, false: a Sound Canvas
   // acts on the whole GS map.
   bool gsScaleTuningOnly;
+
+  // Whether CC120 All Sound Off goes unrecognised, as a device whose MIDI
+  // implementation chart leaves it out ignores it. Omitted, false: it cuts
+  // the part's sound.
+  bool ignoresAllSoundOff;
+
+  // Whether Mono (CC126) and Poly (CC127) cut the part's sound, as All Sound
+  // Off does, rather than releasing its notes as All Notes Off does.
+  // Omitted, false: they release.
+  bool monoPolyCutSound;
 };
 
 // The Sound Canvas family's shared behaviour, for a generation whose ROM layout
