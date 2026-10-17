@@ -3658,12 +3658,93 @@ void matrix_refresh(struct Engine *engine, unsigned part)
    this machine, under 0.1 dB across seventeen values (`M-048`), with the
    System Volume control source at VOLUME (`M-116`'s readback). Every
    controller below 96 is also a matrix source. */
+namespace {
+
+/* Hold 1 off: every note-off the pedal held reaches its voice at once. */
+void release_hold(struct Engine *engine, unsigned part)
+{
+  struct Part &p = engine->parts[part];
+  if (p.hold)
+    for (unsigned i = 0; i < kMaxVoices; ++i) {
+      struct Voice *voice = engine->voices + i;
+      if (voice->allocated && voice->part == part && voice->sustained) {
+        voice->sustained = false;
+        key_off(voice);
+      }
+    }
+  p.hold = false;
+}
+
+/* ALL SOUND OFF cuts rather than releases: the chord goes from -29 to
+   -100 dBFS inside the 0.2 s `M-049` resolves, where a release of the same
+   notes falls 14.5 dB a second. The cut's own shape inside that is not
+   measured. */
+void all_sound_off(struct Engine *engine, unsigned part)
+{
+  struct Part &p = engine->parts[part];
+  for (unsigned i = 0; i < kMaxVoices; ++i) {
+    struct Voice *voice = engine->voices + i;
+    if (voice->allocated && voice->part == part)
+      free_voice(voice);
+  }
+  std::memset(p.held_velocity, 0, sizeof p.held_velocity);
+  p.solo_key = -1;
+}
+
+/* RESET ALL CONTROLLERS runs the part reset `0x0A0137C0`, which rewrites
+   the part's whole controller block. CC11's matrix source is MEASURED at
+   0.0 after CC11 64 (`M-160`, TASK-424).
+
+   @provenance class=DOCUMENTED devices=JV-1080
+   The manual's Reset All Controllers list (MIDI implementation) includes
+   Hold 1 off, modulation 0, channel pressure 0 and pitch bend at its
+   centre. Hold 1 off releases what the pedal held, as the pedal's own
+   release does; a reset that only cleared the flag left those notes
+   sounding for good. */
+void reset_controllers(struct Engine *engine, unsigned part)
+{
+  struct Part &p = engine->parts[part];
+  p.cc[11] = 0u;
+  release_hold(engine, part);
+  p.modulation = 0u;
+  p.cc[1] = 0u;
+  p.pressure = 0u;
+  p.bend = 0;
+  for (unsigned i = 0; i < kMaxVoices; ++i) {
+    struct Voice *voice = engine->voices + i;
+    if (voice->allocated && voice->part == part)
+      voice->voice.bend_ratio =
+        bend_ratio(p.bend, voice->bend_up, voice->bend_down);
+  }
+  matrix_refresh(engine, part);
+}
+
+/* ALL NOTES OFF, and OMNI OFF and ON with it: each releases the part's keys
+   as their own note-offs would, within 1 dB of one another at every frame,
+   and with the hold pedal down nothing changes at all (`M-049`). What the
+   Omni messages do to the receive mode itself is not measured and nothing
+   here changes it. */
+void all_notes_off(struct Engine *engine, unsigned part)
+{
+  struct Part &p = engine->parts[part];
+  for (unsigned i = 0; i < kMaxVoices; ++i) {
+    struct Voice *voice = engine->voices + i;
+    if (voice->allocated && voice->key_down && voice->part == part)
+      voice_note_off(engine, voice);
+  }
+  std::memset(p.held_velocity, 0, sizeof p.held_velocity);
+  p.solo_key = -1;
+}
+
+}  // namespace
+
 bool engine_control_change(void *state, unsigned channel, unsigned controller,
                             unsigned value)
 {
   struct Engine *engine = (struct Engine *)state;
   if (!engine || channel >= kParts || value > 127u)
     return false;
+  const struct XpDeviceProfile *profile = xp_profile(&engine->rom);
   return for_each_part_on(engine, channel, [&](unsigned part) {
     struct Part &p = engine->parts[part];
     if (controller < 128u)
@@ -3680,56 +3761,41 @@ bool engine_control_change(void *state, unsigned channel, unsigned controller,
       }
       break;
     case 1: p.modulation = (uint8_t)value; break;
-    case 64: {
+    case 64:
       /* HOLD-1, on at 64 and above (`04_protocol/controllers.md`). Its
          release hands every note-off it held to the voice at once. */
-      bool hold = value >= 64u;
-      if (p.hold && !hold)
-        for (unsigned i = 0; i < kMaxVoices; ++i) {
-          struct Voice *voice = engine->voices + i;
-          if (voice->allocated && voice->part == part && voice->sustained) {
-            voice->sustained = false;
-            key_off(voice);
-          }
-        }
-      p.hold = hold;
+      if (value >= 64u)
+        p.hold = true;
+      else
+        release_hold(engine, part);
       break;
-    }
     case 120:
-      /* ALL SOUND OFF cuts rather than releases: the chord goes from -29
-         to -100 dBFS inside the 0.2 s `M-049` resolves, where a release
-         of the same notes falls 14.5 dB a second. The cut's own shape
-         inside that is not measured. */
-      for (unsigned i = 0; i < kMaxVoices; ++i) {
-        struct Voice *voice = engine->voices + i;
-        if (voice->allocated && voice->part == part)
-          free_voice(voice);
-      }
-      std::memset(p.held_velocity, 0, sizeof p.held_velocity);
-      p.solo_key = -1;
+      all_sound_off(engine, part);
       break;
     case 123:
     case 124:
     case 125:
-      /* ALL NOTES OFF, and OMNI OFF and ON with it: each releases the
-         part's keys as their own note-offs would, within 1 dB of one
-         another at every frame, and with the hold pedal down nothing
-         changes at all (`M-049`). What the Omni messages do to the
-         receive mode itself is not measured and nothing here changes it. */
-      for (unsigned i = 0; i < kMaxVoices; ++i) {
-        struct Voice *voice = engine->voices + i;
-        if (voice->allocated && voice->key_down && voice->part == part)
-          voice_note_off(engine, voice);
-      }
-      std::memset(p.held_velocity, 0, sizeof p.held_velocity);
-      p.solo_key = -1;
+      all_notes_off(engine, part);
+      break;
+    /* @provenance class=FW-EXACT devices=JV-1080 ref=0x0A013C24,0x0A013DC4,0x0A013EB0
+       MONO runs the All Notes Off handler - skipped for a value above 15 -
+       then writes key assign SOLO into the patch common; POLY runs it with
+       the value forced to 0, then writes POLY (`04_protocol/midi.md`). The
+       manual: "The key assign mode of the patch common parameter is changed
+       to SOLO ... Serves as All Notes Off". */
+    case 126:
+      if (value <= 15u)
+        all_notes_off(engine, part);
+      if (profile->patchFieldKeyAssign != XP_VOICE_FIELD_NONE)
+        p.common[profile->patchFieldKeyAssign] = 1u;
+      break;
+    case 127:
+      all_notes_off(engine, part);
+      if (profile->patchFieldKeyAssign != XP_VOICE_FIELD_NONE)
+        p.common[profile->patchFieldKeyAssign] = 0u;
       break;
     case 121:
-      /* RESET ALL CONTROLLERS runs the part reset `0x0A0137C0`; of what
-         that routine writes, only CC11's matrix source is modelled here:
-         MEASURED at 0.0 after CC11 64 (`M-160`, TASK-424). */
-      p.cc[11] = 0u;
-      matrix_refresh(engine, part);
+      reset_controllers(engine, part);
       break;
     case 101: p.rpn_msb = (uint8_t)value; break;
     case 100: p.rpn_lsb = (uint8_t)value; break;
