@@ -3,6 +3,7 @@
 
 #ifdef EMUSC_RENDER_THREADS
 #include <atomic>
+#include <chrono>
 #include <cfenv>
 #include <condition_variable>
 #include <mutex>
@@ -69,15 +70,18 @@ struct WorkerPool::Shared {
 #endif
     unsigned seen = 0;
     for (;;) {
-      /* A block's jobs follow each other within microseconds, so a worker
-         looks for the next generation for a short while before it sleeps;
-         a condition-variable wake costs tens of microseconds on the small
-         ARM cores this pool exists for. */
-      for (unsigned spin = 0; spin < 4096u; ++spin) {
-        if (generation.load(std::memory_order_acquire) != seen)
-          break;
+      /* The runs of one block follow each other within microseconds, so a
+         worker looks for the next generation for a short while before it
+         sleeps; a condition-variable wake costs tens of microseconds on the
+         small ARM cores this pool exists for. The look is bounded in time,
+         not in yields: under SCHED_FIFO a yield returns at once, and a
+         count of them becomes a busy loop that runs on between blocks,
+         when the next run is a whole audio period away. */
+      const auto spinUntil =
+        std::chrono::steady_clock::now() + std::chrono::microseconds(200);
+      while (generation.load(std::memory_order_acquire) == seen &&
+             std::chrono::steady_clock::now() < spinUntil)
         std::this_thread::yield();
-      }
       Job j;
       void *c;
       unsigned n;
