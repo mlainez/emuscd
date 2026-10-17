@@ -139,6 +139,11 @@ public:
 
   void reset(SoundMap sm, bool resetParts = false);
 
+  // Silences the device whatever it is and whatever it was sent: queued MIDI
+  // is dropped, every voice of every part is cut, pedals are released and
+  // controllers reset. Programs, patches and effects are kept. Not a MIDI
+  // message - a device that would ignore All Sound Off is silenced too -
+  // so a front-end has one way to stop every device.
   void panic(void);
 
   // How many MIDI ports this device answers on: 2 for the SC-88, 1 otherwise.

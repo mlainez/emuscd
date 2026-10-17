@@ -151,6 +151,11 @@ struct XpVoiceEngineOps {
      leaving the voices on the calling thread, if the engine cannot take it.
      Null on a device whose voice path renders on the calling thread only. */
   bool (*set_worker_pool)(void *state, EmuSC::Xp::WorkerPool *pool);
+  /* The host's panic, not a MIDI message: every part's voices cut, its
+     pedals released and its controllers reset, whatever its receive channel
+     and whatever the device's channel-mode messages would do. Programs and
+     patches stay. Null on a device with nothing to stop. */
+  void (*panic)(void *state);
 };
 
 /* Where a record type keeps each field a voice needs, by role. A device's

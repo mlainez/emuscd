@@ -894,6 +894,22 @@ bool device_set_worker_pool(Device *device, WorkerPool *pool)
   return engine_set_worker_pool(&device->engine, pool);
 }
 
+void device_panic(Device *device)
+{
+  if (!device || !device->initialized)
+    return;
+  if (device->voice_ops) {
+    if (device->voice_ops->panic)
+      device->voice_ops->panic(device->voice_state);
+    return;
+  }
+  for (unsigned part = 0; part < XP_ENGINE_PART_COUNT; ++part) {
+    engine_all_sound_off(&device->engine, (uint8_t)part);
+    (void)device_midi(device, (uint8_t)(part / 16u),
+                      (uint8_t)(0xb0u | (part % 16u)), 121, 0);
+  }
+}
+
 void device_set_master_volume(Device *device, uint8_t value)
 {
   if (!device || !device->initialized || value > 127)

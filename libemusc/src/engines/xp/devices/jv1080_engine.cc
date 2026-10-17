@@ -3830,6 +3830,17 @@ bool engine_control_change(void *state, unsigned channel, unsigned controller,
   }) != 0u;
 }
 
+void engine_panic_jv(void *state)
+{
+  struct Engine *engine = (struct Engine *)state;
+  if (!engine)
+    return;
+  for (unsigned part = 0; part < kParts; ++part) {
+    all_sound_off(engine, part);
+    reset_controllers(engine, part);
+  }
+}
+
 bool engine_pitch_bend(void *state, unsigned channel, unsigned value)
 {
   struct Engine *engine = (struct Engine *)state;
@@ -4642,6 +4653,7 @@ const struct XpVoiceEngineOps JV1080_VOICE_ENGINE = {
   EmuSC::Xp::engine_pitch_bend,
   EmuSC::Xp::engine_channel_pressure,
   EmuSC::Xp::engine_set_worker_pool_jv,
+  EmuSC::Xp::engine_panic_jv,
 };
 
 }  // extern "C"

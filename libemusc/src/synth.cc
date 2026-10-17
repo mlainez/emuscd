@@ -1194,14 +1194,16 @@ void Synth::panic(void)
   midiMutex.lock();
   _eventQueue.clear();
   if (_xpDevice)
-    Xp::device_reset_controllers(_xpDevice);
+    Xp::device_panic(_xpDevice);
   midiMutex.unlock();
 
   if (_xpDevice)
     return;
 
-  for (auto &p : _parts)
+  for (auto &p : _parts) {
     p.delete_all_notes();
+    p.control_change(121, 0);
+  }
 }
 
 
