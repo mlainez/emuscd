@@ -48,6 +48,8 @@ emuscd --device sc88 --name "My Synth"
 
 ```
 --device NAME       Device to emulate (default: sc88); sc55, sc55mkii, sc88, jv880, jv1080
+--reset MODE        gs or gm (default: gs); gm keeps a device with a GM mode in it
+                    whatever SysEx it is sent, a device without one runs in GS
 --name NAME         ALSA MIDI port name (default: emuscd)
 --pcm DEVICE        ALSA PCM output device (default: default)
 --list-pcm          List ALSA PCM devices and exit
@@ -146,6 +148,8 @@ emusc-winmidi.exe --device sc88 --midi-in 1
 ```
 --device NAME       Device to emulate (default: sc88); sc55, sc55mkii, sc88, jv880, jv1080
 --midi-in N          MIDI input device index (default: 0)
+--reset MODE         gs or gm (default: gs); gm keeps a device with a GM mode in it
+                     whatever SysEx it is sent, a device without one runs in GS
 --audio-api API      Audio output API: auto, winmm or dsound (default: auto,
                      DirectSound with WinMM fallback)
 --wave-out N         WinMM wave output device index (default: system default)

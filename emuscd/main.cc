@@ -115,6 +115,7 @@ class EmuscdDaemon {
   std::unique_ptr<EmuSC::Synth> synth;
   std::string device_name;
   std::string rom_dir;
+  ResetMode reset_mode;
 
   std::atomic<bool> running{true};
   std::atomic<bool> device_change_requested{false};
@@ -128,10 +129,11 @@ public:
                unsigned int requested_rate, unsigned int latency_ms,
                unsigned int block, unsigned int threads,
                const std::vector<unsigned>& workers, bool stats,
-               double gain_db)
+               double gain_db, ResetMode reset)
       : sample_rate(requested_rate), block_frames(block),
         render_threads(threads), worker_cpus(workers), show_stats(stats),
-        gain_lin(gain_db_to_linear(gain_db)), rom_dir(rom_directory) {
+        gain_lin(gain_db_to_linear(gain_db)), rom_dir(rom_directory),
+        reset_mode(reset) {
     init_alsa_midi(port_name);
     init_alsa_audio(pcm_device, latency_ms);
     if (!load_device(dev)) {
@@ -227,16 +229,14 @@ public:
     }
 
     std::unique_ptr<EmuSC::Synth> new_synth(
-      new EmuSC::Synth(*new_ctrl, *new_wave, SOUND_MAP));
+      new EmuSC::Synth(*new_ctrl, *new_wave));
     new_synth->set_audio_format(sample_rate, 2);
     new_synth->set_render_threads(render_threads, worker_cpus);
 
-    // Power-on reset, which is what the hardware does when it is switched on
-    // and what a GS reset in the stream asks for later. It must follow
-    // set_audio_format(), which is where the 16 parts are instantiated: called
-    // before that, the resetParts loop has nothing to walk.
+    // Power-on reset (see power_on()), which is what the hardware does when it
+    // is switched on and what a GS reset in the stream asks for later.
     //
-    // On a Sound Canvas the reset is redundant at startup - Settings::reset()
+    // On a Sound Canvas a GS reset is redundant at startup - Settings::reset()
     // runs exactly the four _initialize_*/_apply_device_performance calls the
     // Settings constructor runs, so a freshly built Synth already holds the
     // same defaults, bank 0 program 0 on every part and Drum1 on part 10. It
@@ -248,7 +248,7 @@ public:
     // PerformanceLayout::resetSelector) it is not redundant: it is what takes
     // the machine out of its layered boot Performance and onto the channels a
     // multitimbral stream expects.
-    new_synth->reset(SOUND_MAP, true);
+    const PowerOnState state = power_on(*new_synth, reset_mode);
 
     // Destroy the old Synth before its ControlRom/WaveRom, which it holds by
     // reference, are replaced out from under it.
@@ -260,6 +260,9 @@ public:
 
     std::cout << "Loaded device: " << dev << " (" << ctrl_rom->model()
               << " v" << ctrl_rom->version() << ")" << std::endl;
+    const std::string msg = power_on_message(state, "emuscd", dev);
+    if (!msg.empty())
+      std::cout << msg << std::endl;
     return true;
   }
 
@@ -425,6 +428,7 @@ int main(int argc, char* argv[]) {
   bool stats = false;
   int rt_priority = 0;
   double gain_db = 0.0;
+  ResetMode reset_mode = ResetMode::GS;
 
   for (int i = 1; i < argc; i++) {
     std::string arg = argv[i];
@@ -474,6 +478,11 @@ int main(int argc, char* argv[]) {
       }
     } else if (arg == "--gain-db") {
       gain_db = std::stod(need("--gain-db"));
+    } else if (arg == "--reset") {
+      if (!parse_reset_mode(need("--reset"), reset_mode)) {
+        std::cerr << "emuscd: --reset must be gs or gm" << std::endl;
+        return 1;
+      }
     } else if (arg == "--help" || arg == "-h") {
       std::cout
           << "emuscd - Roland Sound Canvas daemon\n"
@@ -481,6 +490,10 @@ int main(int argc, char* argv[]) {
           << "Options:\n"
           << "  --device NAME       Device to emulate (default: sc88)\n"
           << "                       Supported: sc55, sc55mkii, sc88, jv880, jv1080\n"
+          << "  --reset MODE        gs or gm (default: gs). gm keeps every device\n"
+          << "                       that has a GM mode in it while emuscd runs,\n"
+          << "                       whatever SysEx it is sent; a device without\n"
+          << "                       one runs in GS\n"
           << "  --name NAME         ALSA MIDI port name (default: emuscd)\n"
           << "  --pcm DEVICE        ALSA PCM output device (default: default)\n"
           << "  --list-pcm          List ALSA PCM devices and exit\n"
@@ -560,7 +573,7 @@ int main(int argc, char* argv[]) {
   try {
     EmuscdDaemon daemon(device, port_name, pcm_device, rom_dir, rate,
                          latency_ms, block, threads, worker_cpus, stats,
-                         gain_db);
+                         gain_db, reset_mode);
     daemon.run();
   } catch (const std::exception& e) {
     std::cerr << "Fatal error: " << e.what() << std::endl;

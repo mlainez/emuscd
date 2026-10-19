@@ -21,13 +21,53 @@ using emusc_tools::default_rom_dir;
 using emusc_tools::gain_db_to_linear;
 using emusc_tools::apply_gain;
 
-// The sound map emuscd runs in. Named once so that the value handed to the
-// Synth constructor and the value handed to its power-on reset cannot drift
-// apart: reset(sm, ...) re-applies the map, so passing a different one there
-// would silently switch the device into another mode. GS is the Synth default
-// and the mode every supported device is addressed in; emuscd exposes no
-// option to change it.
-inline const EmuSC::Synth::SoundMap SOUND_MAP = EmuSC::Synth::SoundMap::GS;
+// --reset: the mode every device this daemon loads is powered on in, kept
+// for as long as it runs, across device switches.
+enum class ResetMode { GS, GM };
+
+inline bool parse_reset_mode(const std::string &s, ResetMode &out) {
+  if (s == "gs") { out = ResetMode::GS; return true; }
+  if (s == "gm") { out = ResetMode::GM; return true; }
+  return false;
+}
+
+// What power_on() left the device in.
+enum class PowerOnState { GS, GMLocked, GMUnavailable };
+
+// The power-on reset, which is what the hardware does when it is switched on.
+// It must follow set_audio_format(), which is where the parts are
+// instantiated and the SC-88 and JV-1080 engines are opened: before that the
+// reset has nothing to act on, and has_gm_mode() nothing to ask.
+//
+// GM asks for a GM-only device: the reset enters GM mode and the lock keeps it
+// there whatever SysEx arrives. A device without a GM mode is reset into GS
+// instead, its default.
+inline PowerOnState power_on(EmuSC::Synth &synth, ResetMode mode) {
+  using SoundMap = EmuSC::Synth::SoundMap;
+  if (mode == ResetMode::GM && synth.has_gm_mode()) {
+    synth.reset(SoundMap::GS_GM, true);
+    synth.set_gm_locked(true);
+    return PowerOnState::GMLocked;
+  }
+  synth.reset(SoundMap::GS, true);
+  return mode == ResetMode::GM ? PowerOnState::GMUnavailable : PowerOnState::GS;
+}
+
+// The line a daemon prints after power_on(), empty when there is nothing to
+// say. `prog` names the daemon, `dev` the device.
+inline std::string power_on_message(PowerOnState state, const std::string &prog,
+                                    const std::string &dev) {
+  switch (state) {
+  case PowerOnState::GMLocked:
+    return prog + ": " + dev + " is in GM mode and stays in it while " + prog +
+           " runs, whatever SysEx it is sent";
+  case PowerOnState::GMUnavailable:
+    return prog + ": no GM mode available on " + dev +
+           ", so GS was selected as the default";
+  default:
+    return "";
+  }
+}
 
 inline bool device_supported(const std::string &dev) {
   for (const char *d : SUPPORTED_DEVICES)
