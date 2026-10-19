@@ -780,6 +780,13 @@ struct XpDeviceProfile {
   uint8_t sysexModelId;
   uint8_t sysexAddressBytes;
 
+  /* True on a device the shared firmware-port engine serves whose firmware
+     has a GM mode: the universal GM System On, 7E 7F 09 01, is received
+     and puts every part in it. A device with its own voice path says the
+     same through XpVoiceEngineOps::gm_system_on instead, and leaves this
+     false. */
+  bool firmwarePortGmMode;
+
   /* How far one voice sits below the mix's full scale. A device that sums
      many voices into a fixed-width mixer needs headroom for their sum, and
      on a device whose mixer is not recovered this is the one number that

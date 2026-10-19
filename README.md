@@ -478,6 +478,8 @@ Common options:
 
 ```
   --device NAME       Device to emulate (default: sc88); sc55, sc55mkii, sc88, jv880, jv1080
+  --reset MODE        gs or gm: keep every device in that mode whatever SysEx it is
+                      sent; one without it is kept in the other (default: neither)
   --name NAME         ALSA MIDI port name (default: emuscd)
   --midi-in PORT      Also connect from an existing MIDI input: index, or name or part of one
   --list-midi-in      List MIDI input ports and exit
@@ -539,6 +541,8 @@ Common options:
 ```
   --device NAME       Device to emulate (default: sc88); sc55, sc55mkii, sc88, jv880, jv1080
   --midi-in PORT       MIDI input device: index, or name or part of one (default: 0)
+  --reset MODE         gs or gm: keep every device in that mode whatever SysEx it is
+                       sent; one without it is kept in the other (default: neither)
   --wave-out N         Wave output device index (default: system default)
   --list-midi-in       List MIDI input devices and exit
   --list-wave-out      List wave output devices and exit

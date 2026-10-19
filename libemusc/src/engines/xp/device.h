@@ -138,6 +138,16 @@ struct ChannelState {
   uint8_t rpn_lsb;
   uint8_t nrpn_msb;
   uint8_t nrpn_lsb;
+  /* The part's Rx.Bank Select, Rx.Bank Select LSB and Rx.NRPN switches
+     (`40 1x 23`, `24`, `0a`). The firmware keeps the first two inverted,
+     as receive-off bits 0 and 1 of part-structure +18, and the third as
+     receive-on bit 15 of the switch word at +2. CC0 is stored only with
+     bit 0 clear (`3172`), CC32 only with both clear (`317c`), and the
+     NRPN numbers only with bit 15 set (`3253`, `3261`). GM System On is
+     what turns bank select and NRPN off. */
+  bool rx_bank_select;
+  bool rx_bank_select_lsb;
+  bool rx_nrpn;
   /* The controller destination matrix, `40 2x ss`: six source groups in
      the published order, eleven depths each. Only the cutoff column is
      applied so far; the rest are held so a song's settings are not lost,
@@ -232,10 +242,20 @@ bool device_init_decoded(
   enum xp_fractional_wrap wrap);
 void device_destroy(Device *device);
 void device_reset_controllers(Device *device);
-/* The GM System On a device with its own voice path acts on, as if the
- * message had arrived. False, with nothing changed, on a device that has
- * no GM mode - which includes every device on the shared firmware port. */
+/* GM System On, as if the message had arrived: through the device's own
+ * voice path when it has one, or through the shared firmware port when the
+ * profile's firmwarePortGmMode says the device has a GM mode there. False,
+ * with nothing changed, on a device that has no GM mode. */
 bool device_gm_system_on(Device *device);
+/* The receive switches GM System On turns off on the firmware port, Rx.Bank
+ * Select and Rx.NRPN on every part, turned off without the reset that comes
+ * before them. False, with nothing changed, on a device without a GM mode
+ * there. */
+bool device_gm_receive_off(Device *device);
+/* Whether device_gm_system_on() would act: the device has a GM mode. */
+bool device_has_gm_mode(const Device *device);
+/* Whether the device's own SysEx is GS: its model ID is GS's, 42H. */
+bool device_has_gs_mode(const Device *device);
 /* True on a device whose profile has a host reset enter GM mode; see
  * XpDeviceProfile::hostResetEntersGm. */
 bool device_host_reset_enters_gm(const Device *device);

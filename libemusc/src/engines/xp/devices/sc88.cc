@@ -308,6 +308,11 @@ const struct XpDeviceProfile SC88_PROFILE = {
   .sysexModelId = 0x42u,
   .sysexAddressBytes = 3u,
 
+  /* The universal non-real-time handler at 0x0e70 takes 7E 7F 09 and
+     hands the sub-ID on; 0x17e2 sends 01 to the GM System On at 0x128c6.
+     scdb 03_disassembly/sysex_handlers.md. */
+  .firmwarePortGmMode = true,
+
   /* This device's voice path is the shared firmware port in engine.h and
      renderer.h, which is what a null here selects. */
   .voiceEngine = nullptr,

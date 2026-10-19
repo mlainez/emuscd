@@ -388,6 +388,17 @@ bool sysexWrite(Device *device, uint8_t port, uint32_t address,
        which of them the device keeps is not established. */
     for (unsigned part = 0; part < XP_ENGINE_PART_COUNT; ++part)
       engine_all_sound_off(&device->engine, (uint8_t)part);
+    /* @provenance class=FW-STRUCT devices=SC-88 ref=0x37a8,0x12a10,0x129dd,0x13184
+       Both candidates for this address's handler run the module reset,
+       which copies the part image at 0x13184 with +18 = 00, so Rx.Bank
+       Select and its LSB come back on, as the manual says (om-125). What
+       they leave Rx.NRPN at differs - `0x12a10` turns it on, `0x129dd`
+       off again afterwards - and which one this address reaches is not
+       established, so Rx.NRPN is left as it was. */
+    for (unsigned part = 0; part < XP_ENGINE_PART_COUNT; ++part) {
+      device->channels[part].rx_bank_select = true;
+      device->channels[part].rx_bank_select_lsb = true;
+    }
     return true;
   }
   if (address == 0x40007f) {
@@ -586,6 +597,38 @@ bool sysexWrite(Device *device, uint8_t port, uint32_t address,
       blockPart((uint8_t)((address >> 8) & 0x0f), port, &part)) {
     ChannelState *state = device->channels + part;
     switch (address & 0xffu) {
+    case 0x0a:
+      /* @provenance class=FW-EXACT devices=SC-88 ref=0x13854,0x456b,0x360b
+         Rx.NRPN: entry 0a of the `40 1x` table at 0x13804 names the
+         switch-word writer `456b` and bit 15. Turning it off also runs
+         `360b`, which leaves no NRPN selected. The handler takes any
+         nonzero value as on; values above the manual's 00..01 are refused
+         here, as this file refuses other out-of-range writes. */
+      if (value > 1)
+        return false;
+      state->rx_nrpn = value != 0;
+      if (!state->rx_nrpn) {
+        state->nrpn_msb = 127;
+        state->nrpn_lsb = 127;
+      }
+      return true;
+    case 0x23:
+    case 0x24:
+      /* @provenance class=FW-EXACT devices=SC-88 ref=0x1391c,0x13924,0x4825
+         Rx.Bank Select and Rx.Bank Select LSB. Both table entries name
+         `4825`, which sets the part's receive-off bit for 00 and clears
+         it otherwise; setting either bit also clears the stored CC0
+         value at `d860 + 2*part`. Values above 01 are refused, as for
+         Rx.NRPN. */
+      if (value > 1)
+        return false;
+      if ((address & 0xffu) == 0x23u)
+        state->rx_bank_select = value != 0;
+      else
+        state->rx_bank_select_lsb = value != 0;
+      if (value == 0)
+        state->variation = 0;
+      return true;
     case 0x14:
       if (value > 2)
         return false;
@@ -727,10 +770,52 @@ void device_destroy(Device *device)
 
 bool device_gm_system_on(Device *device)
 {
-  if (!device || !device->initialized || !device->voice_ops ||
-      !device->voice_ops->gm_system_on)
+  if (!device || !device->initialized)
     return false;
-  return device->voice_ops->gm_system_on(device->voice_state);
+  if (device->voice_ops) {
+    if (!device->voice_ops->gm_system_on)
+      return false;
+    return device->voice_ops->gm_system_on(device->voice_state);
+  }
+  if (!xp_profile(&device->renderer.rom)->firmwarePortGmMode)
+    return false;
+  /* @provenance class=FW-EXACT devices=SC-88 ref=0x128c6,0x128fb,0x1291a,0x129a1,0x129c0,0x13184
+     GM System On runs the same module reset a GS Reset does (`0x12aa1`,
+     `0x12ac5`, from the part image at 0x13184) and differs from it in two
+     bits per part: it sets +18 bit 0, Rx.Bank Select off, where the GS
+     Reset instead sets +2 bit 15, Rx.NRPN on, which the image leaves off.
+     Rx.Bank Select LSB stays on, but CC32 is refused while bit 0 is set.
+     The firmware's reset reaches one module in MODE-2 and both in MODE-1;
+     this reset, like the GS Reset here, reaches every part. */
+  device_reset_controllers(device);
+  return device_gm_receive_off(device);
+}
+
+bool device_gm_receive_off(Device *device)
+{
+  if (!device || !device->initialized || device->voice_ops ||
+      !xp_profile(&device->renderer.rom)->firmwarePortGmMode)
+    return false;
+  for (unsigned part = 0; part < XP_ENGINE_PART_COUNT; ++part) {
+    device->channels[part].rx_bank_select = false;
+    device->channels[part].rx_nrpn = false;
+  }
+  return true;
+}
+
+bool device_has_gm_mode(const Device *device)
+{
+  if (!device || !device->initialized)
+    return false;
+  if (device->voice_ops)
+    return device->voice_ops->gm_system_on != nullptr;
+  return xp_profile(&device->renderer.rom)->firmwarePortGmMode;
+}
+
+bool device_has_gs_mode(const Device *device)
+{
+  return device && device->initialized &&
+         xp_profile(&device->renderer.rom)->sysexModelId == 0x42;
 }
 
 bool device_host_reset_enters_gm(const Device *device)
@@ -867,6 +952,11 @@ void device_reset_controllers(Device *device)
     channel->rpn_lsb = 127;
     channel->nrpn_msb = 127;
     channel->nrpn_lsb = 127;
+    /* The part image at 0x13184 has +18 = 00, both bank switches on; the
+       GS Reset's `0x129a1`/`0x129c0` then set Rx.NRPN, +2 bit 15. */
+    channel->rx_bank_select = true;
+    channel->rx_bank_select_lsb = true;
+    channel->rx_nrpn = true;
     channel->same_note_mode = XP_SAME_NOTE_LIMITED_MULTI;
     /* GS puts the rhythm part on MIDI channel 10, i.e. part 9 of each port,
        and a GS reset restores exactly that. It plays from drum setup MAP1:
@@ -967,11 +1057,28 @@ bool device_sysex(Device *device, uint8_t port,
   if (device->voice_ops && size == 4u && data[0] == 0x7e &&
       data[1] == 0x7f && data[2] == 0x09 && data[3] == 0x01)
     return device_gm_system_on(device);
+  const struct XpDeviceProfile *profile = xp_profile(&device->renderer.rom);
+  /* @provenance class=FW-EXACT devices=SC-88 ref=0x0e70,0x17e2,0x128c6,0x1296c
+     The same message on a device the firmware port serves, when its
+     firmware has a GM mode. `0x0e70` compares 7F and 09 and nothing else
+     of the header, so here too only the broadcast ID is received; `0x17e2`
+     then acts on two sub-IDs: 01, GM System On, and 02, which runs the
+     GS Reset's own module reset (`0x1296c`). Both are gated by the panel's
+     Rx GM On switch, which this device does not model and leaves on. */
+  if (!device->voice_ops && profile->firmwarePortGmMode && size == 4u &&
+      data[0] == 0x7e && data[1] == 0x7f && data[2] == 0x09) {
+    if (data[3] == 0x01)
+      return device_gm_system_on(device);
+    if (data[3] == 0x02) {
+      device_reset_controllers(device);
+      return true;
+    }
+    return false;
+  }
   /* 41 dev <model> 12, the device's own address bytes, at least one data
      byte, checksum. The model id and the address width are the device's,
      so they come from its profile: three bytes on a GS device, four on
      this family's JV member. */
-  const struct XpDeviceProfile *profile = xp_profile(&device->renderer.rom);
   const size_t addressBytes = profile->sysexAddressBytes;
   if (addressBytes < 1u || addressBytes > 4u)
     return false;
@@ -1088,6 +1195,9 @@ bool device_midi(Device *device, uint8_t port, uint8_t status,
   case 0xb0:
     switch (data1) {
     case 0:
+      /* `3172`: refused while Rx.Bank Select is off. */
+      if (!state->rx_bank_select)
+        return true;
       state->variation = data2;
       return true;
     case 1:
@@ -1245,6 +1355,9 @@ bool device_midi(Device *device, uint8_t port, uint8_t status,
        * resolve no tone at all, which is a silenced part rather than a
        * changed one; this refuses the message instead, and no corpus file
        * sends one. */
+      /* `317c`: refused while either bank switch is off. */
+      if (!state->rx_bank_select || !state->rx_bank_select_lsb)
+        return true;
       if (data2 > 2)
         return false;
       state->tone_map_forced = data2;
@@ -1260,13 +1373,17 @@ bool device_midi(Device *device, uint8_t port, uint8_t status,
     case 66:
       engine_sostenuto(&device->engine, part, data2 >= 64);
       return true;
+    /* `3253` and `3261` leave RPN unselected whatever Rx.NRPN says, and
+       store the NRPN number only while it is on. */
     case 98:
-      state->nrpn_lsb = data2;
+      if (state->rx_nrpn)
+        state->nrpn_lsb = data2;
       state->rpn_msb = 127;
       state->rpn_lsb = 127;
       return true;
     case 99:
-      state->nrpn_msb = data2;
+      if (state->rx_nrpn)
+        state->nrpn_msb = data2;
       state->rpn_msb = 127;
       state->rpn_lsb = 127;
       return true;

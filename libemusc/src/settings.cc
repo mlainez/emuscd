@@ -668,6 +668,20 @@ void Settings::_initialize_drumSet_params(void)
 }
 
 
+bool Settings::has_gm_mode(void) const
+{
+  // Why the SC-55 and a Roland-only receiver have none: see set_gm_mode().
+  return _ctrlRom.generation() != ControlRom::SynthGen::SC55 &&
+         !_ctrlRom.device()->rolandSysExOnly;
+}
+
+
+bool Settings::has_gs_mode(void) const
+{
+  return !_ctrlRom.device()->gsScaleTuningOnly;
+}
+
+
 void Settings::set_gm_mode(void)
 {
   // "Turn General MIDI System On" sets every internal parameter to the
@@ -683,12 +697,10 @@ void Settings::set_gm_mode(void)
   // SC-55 a bank-selected variation tone and an NRPN both still take effect
   // after the message, while on the SC-55mkII neither does (P-0092). So the
   // SC-55 reaches plain GS defaults here and nothing more.
-  if (_ctrlRom.generation() == ControlRom::SynthGen::SC55)
-    return;
-
-  // A device that cannot receive GM System On has no GM mode: a GS_GM host
-  // reset leaves it exactly as a GS one does, receive switches included.
-  if (_ctrlRom.device()->rolandSysExOnly)
+  //
+  // A device that cannot receive GM System On has no GM mode either: a GS_GM
+  // host reset leaves it exactly as a GS one does, receive switches included.
+  if (!has_gm_mode())
     return;
 
   for (int p = 0; p < 16; p ++) {           // TODO: Support SC-88 with 32 parts

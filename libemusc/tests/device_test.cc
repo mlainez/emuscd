@@ -448,6 +448,94 @@ int main(void)
                                     sizeof selected_bad));
     assert(device.channels[0].tone_map_selected == XP_TONE_MAP_SC55);
   }
+  /* GM System On: bank select and NRPN stop being received, a GS Reset
+     brings both back, and the part's selected tone map - SC-55 since the
+     block above - survives every one of these resets. */
+  {
+    static const uint8_t gm_on[] = { 0xf0, 0x7e, 0x7f, 0x09, 0x01, 0xf7 };
+    static const uint8_t gm_on_own_id[] = { 0x7e, 0x10, 0x09, 0x01 };
+    static const uint8_t gm_off[] = { 0x7e, 0x7f, 0x09, 0x02 };
+    EmuSC::Xp::ChannelState *ch = &device.channels[0];
+    const uint8_t cutoff_reset = 64;
+
+    /* What a part receives before: CC0, CC32 and an NRPN cutoff. */
+    assert(EmuSC::Xp::device_midi(&device, 0, 0xb0, 0, 5));
+    assert(ch->variation == 5);
+    assert(EmuSC::Xp::device_midi(&device, 0, 0xb0, 99, 0x01));
+    assert(EmuSC::Xp::device_midi(&device, 0, 0xb0, 98, 0x20));
+    assert(EmuSC::Xp::device_midi(&device, 0, 0xb0, 6, 10));
+    assert(ch->cutoff == 10);
+
+    /* `0x0e70` compares the device ID with 7F only. */
+    assert(!EmuSC::Xp::device_sysex(&device, 0, gm_on_own_id,
+                                     sizeof gm_on_own_id));
+    assert(ch->rx_bank_select && ch->variation == 5);
+
+    assert(EmuSC::Xp::device_sysex(&device, 0, gm_on, sizeof gm_on));
+    assert(!ch->rx_bank_select && ch->rx_bank_select_lsb && !ch->rx_nrpn);
+    assert(!device.channels[31].rx_bank_select && !device.channels[31].rx_nrpn);
+    assert(ch->variation == 0 && ch->cutoff == cutoff_reset);
+    assert(ch->tone_map_selected == XP_TONE_MAP_SC55);
+    assert(device.engine.parts[0].tone_map == XP_TONE_MAP_SC55);
+
+    assert(EmuSC::Xp::device_midi(&device, 0, 0xb0, 0, 8));
+    assert(ch->variation == 0);
+    assert(EmuSC::Xp::device_midi(&device, 0, 0xb0, 32, 2));
+    assert(ch->tone_map_forced == 0);
+    assert(device.engine.parts[0].tone_map == XP_TONE_MAP_SC55);
+    assert(EmuSC::Xp::device_midi(&device, 0, 0xb0, 99, 0x01));
+    assert(EmuSC::Xp::device_midi(&device, 0, 0xb0, 98, 0x20));
+    assert(ch->nrpn_msb == 127 && ch->nrpn_lsb == 127);
+    EmuSC::Xp::device_midi(&device, 0, 0xb0, 6, 10);
+    assert(ch->cutoff == cutoff_reset);
+
+    /* GS Reset turns both switches back on. */
+    assert(dt1(&device, 0x40, 0x00, 0x7f, 0x00));
+    assert(ch->rx_bank_select && ch->rx_bank_select_lsb && ch->rx_nrpn);
+    assert(ch->tone_map_selected == XP_TONE_MAP_SC55);
+    assert(EmuSC::Xp::device_midi(&device, 0, 0xb0, 0, 8));
+    assert(ch->variation == 8);
+    assert(EmuSC::Xp::device_midi(&device, 0, 0xb0, 32, 2));
+    assert(device.engine.parts[0].tone_map == XP_TONE_MAP_SC88);
+    assert(EmuSC::Xp::device_midi(&device, 0, 0xb0, 99, 0x01));
+    assert(EmuSC::Xp::device_midi(&device, 0, 0xb0, 98, 0x20));
+    assert(EmuSC::Xp::device_midi(&device, 0, 0xb0, 6, 10));
+    assert(ch->cutoff == 10);
+
+    /* The same mode reached without the message, and left by sub-ID 02,
+       which `0x17e2` sends to the GS Reset's own module reset. */
+    assert(EmuSC::Xp::device_gm_system_on(&device));
+    assert(!ch->rx_bank_select && !ch->rx_nrpn);
+    assert(EmuSC::Xp::device_sysex(&device, 0, gm_off, sizeof gm_off));
+    assert(ch->rx_bank_select && ch->rx_nrpn);
+
+    /* The switches themselves, `40 1x 23`, `24` and `0a`; block 1 is
+       part 1. Turning a bank switch off also drops the stored CC0. */
+    assert(EmuSC::Xp::device_midi(&device, 0, 0xb0, 0, 8));
+    assert(dt1(&device, 0x40, 0x11, 0x24, 0x00));
+    assert(ch->rx_bank_select && !ch->rx_bank_select_lsb);
+    assert(ch->variation == 0);
+    assert(EmuSC::Xp::device_midi(&device, 0, 0xb0, 0, 8));
+    assert(ch->variation == 8);
+    assert(EmuSC::Xp::device_midi(&device, 0, 0xb0, 32, 1));
+    assert(ch->tone_map_forced == 0);
+    assert(dt1(&device, 0x40, 0x11, 0x24, 0x01));
+    assert(dt1(&device, 0x40, 0x11, 0x23, 0x00));
+    assert(!ch->rx_bank_select && ch->variation == 0);
+    assert(dt1(&device, 0x40, 0x11, 0x23, 0x01));
+    assert(ch->rx_bank_select);
+    assert(EmuSC::Xp::device_midi(&device, 0, 0xb0, 99, 0x01));
+    assert(dt1(&device, 0x40, 0x11, 0x0a, 0x00));
+    assert(!ch->rx_nrpn && ch->nrpn_msb == 127);
+    assert(dt1(&device, 0x40, 0x11, 0x0a, 0x01));
+    assert(ch->rx_nrpn);
+
+    /* System Mode Set turns the bank switches back on. */
+    assert(EmuSC::Xp::device_gm_system_on(&device));
+    assert(dt1(&device, 0x00, 0x00, 0x7f, 0x00));
+    assert(ch->rx_bank_select && ch->rx_bank_select_lsb);
+    assert(dt1(&device, 0x40, 0x00, 0x7f, 0x00));
+  }
   EmuSC::Xp::device_destroy(&device);
   free(chip);
   free(control);

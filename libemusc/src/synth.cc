@@ -823,7 +823,7 @@ void Synth::_apply_midi_sysex(uint8_t *data, uint16_t length)
       return;
 
     midiMutex.lock();
-    reset(SoundMap::GS_GM, true);
+    reset(_modeLock == ModeLock::GS ? SoundMap::GS : SoundMap::GS_GM, true);
     midiMutex.unlock();
     return;
   }
@@ -920,8 +920,14 @@ void Synth::_apply_midi_sysex(uint8_t *data, uint16_t length)
 //  _midi_input_sysex_RQ1(&data[5], length - 5 - 2); // Add reply data buffer
 
   // Data set 1 (DT1)
-  if (data[4] == 0x12)
+  if (data[4] == 0x12) {
     _midi_input_sysex_DT1(data[3], &data[5], length - 5 - 2);
+
+    // GM mode is GS with some receive switches off, and both a GS Reset and
+    // a DT1 to those switches turn them back on: put them back.
+    if (_modeLock == ModeLock::GM)
+      _settings->set_gm_mode();
+  }
 
   midiMutex.unlock();
 }
@@ -951,7 +957,7 @@ int Synth::get_next_frame(float &lOut, float &rOut)
            _eventQueue.front().applyAt <= _framesDelivered) {
       PendingEvent &e = _eventQueue.front();
       if (e.isSysEx)
-        Xp::device_sysex(_xpDevice, e.port, e.sysex.data(), e.sysex.size());
+        _xp_sysex(e.port, e.sysex.data(), e.sysex.size());
       else
         Xp::device_midi(_xpDevice, e.port, e.status, e.data1, e.data2);
       _eventQueue.pop_front();
@@ -1013,7 +1019,7 @@ int Synth::get_next_frames(float *out, size_t frames)
            _eventQueue.front().applyAt <= _framesDelivered) {
       PendingEvent &e = _eventQueue.front();
       if (e.isSysEx)
-        Xp::device_sysex(_xpDevice, e.port, e.sysex.data(), e.sysex.size());
+        _xp_sysex(e.port, e.sysex.data(), e.sysex.size());
       else
         Xp::device_midi(_xpDevice, e.port, e.status, e.data1, e.data2);
       _eventQueue.pop_front();
@@ -1204,6 +1210,55 @@ void Synth::panic(void)
     p.delete_all_notes();
     p.control_change(121, 0);
   }
+}
+
+
+bool Synth::has_gs_mode(void) const
+{
+  if (_ctrlRom.uses_xp_engine())
+    return Xp::device_has_gs_mode(_xpDevice);
+  return _settings->has_gs_mode();
+}
+
+
+bool Synth::has_gm_mode(void) const
+{
+  if (_ctrlRom.uses_xp_engine())
+    return Xp::device_has_gm_mode(_xpDevice);
+  return _settings->has_gm_mode();
+}
+
+
+void Synth::set_mode_lock(ModeLock lock)
+{
+  _modeLock = lock;
+}
+
+
+// A SysEx to the XP engine, under the mode lock. Only a device with both modes
+// has a SysEx path from one to the other, and on it GM mode is GS with Rx.Bank
+// Select and Rx.NRPN off, as on the GP engine. Locked in GS, a GM System On
+// does what a GS Reset does; locked in GM, whatever a message turned back on
+// is turned off again, so a GS Reset resets into GM.
+void Synth::_xp_sysex(uint8_t port, const uint8_t *data, size_t size)
+{
+  const bool bothModes = _modeLock != ModeLock::None &&
+                         Xp::device_has_gs_mode(_xpDevice) &&
+                         Xp::device_has_gm_mode(_xpDevice);
+  // The message with or without its framing bytes, as Xp::device_sysex()
+  // takes it.
+  const uint8_t *body = data;
+  size_t n = size;
+  if (n && body[0] == 0xf0) { ++body; --n; }
+  if (n && body[n - 1] == 0xf7) --n;
+  if (bothModes && _modeLock == ModeLock::GS && n == 4 && body[0] == 0x7e &&
+      body[1] == 0x7f && body[2] == 0x09 && body[3] == 0x01) {
+    Xp::device_reset_controllers(_xpDevice);
+    return;
+  }
+  Xp::device_sysex(_xpDevice, port, data, size);
+  if (bothModes && _modeLock == ModeLock::GM)
+    Xp::device_gm_receive_off(_xpDevice);
 }
 
 

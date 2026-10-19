@@ -43,6 +43,11 @@ const char *USAGE =
 "                       Supported: sc55, sc55mkii, sc88, jv880, jv1080\n"
 "  --midi-in PORT       MIDI input device: an index, or a name or any part\n"
 "                       of one, any case (default: 0). See --list-midi-in\n"
+"  --reset MODE         gs or gm: keep every device in that mode while\n"
+"                        emusc-winmidi runs, whatever SysEx it is sent; a\n"
+"                        device without it is kept in the other one.\n"
+"                        Without it, devices start in GS and the MIDI\n"
+"                        stream may switch them\n"
 "  --audio-api API      Audio output API: auto, winmm or dsound (default:\n"
 "                        auto - DirectSound, falling back to WinMM if it\n"
 "                        cannot be opened; winmm/dsound force one, and a\n"
@@ -122,9 +127,9 @@ public:
   WinMidiDaemon(const std::string &dev, const std::string &romDir,
                 const std::string &midiIn, int waveOutId, unsigned rate, unsigned block,
                 unsigned latencyMs, double gainDb, AudioApi api,
-                int dsoundOutId)
+                int dsoundOutId, ResetMode resetMode)
       : _sampleRate(rate), _blockFrames(block), _romDir(romDir),
-        _gainLin(gain_db_to_linear(gainDb)) {
+        _resetMode(resetMode), _gainLin(gain_db_to_linear(gainDb)) {
     InitializeCriticalSection(&_midiLock);
     InitializeCriticalSection(&_sysexLock);
     if (!load_device(dev)) {
@@ -178,9 +183,9 @@ public:
     }
 
     std::unique_ptr<EmuSC::Synth> new_synth(
-      new EmuSC::Synth(*new_ctrl, *new_wave, SOUND_MAP));
+      new EmuSC::Synth(*new_ctrl, *new_wave));
     new_synth->set_audio_format(_sampleRate, 2);
-    new_synth->reset(SOUND_MAP, true);
+    const PowerOnState state = power_on(*new_synth, _resetMode);
 
     // Only the main loop (run()) ever touches _synth after construction, on
     // both the fill/pump and the device-switch path below, so there's no
@@ -193,6 +198,9 @@ public:
 
     std::fprintf(stderr, "emusc-winmidi: loaded device %s (%s v%s)\n",
                  dev.c_str(), _ctrlRom->model().c_str(), _ctrlRom->version().c_str());
+    const std::string msg = power_on_message(state, "emusc-winmidi", dev);
+    if (!msg.empty())
+      std::fprintf(stderr, "%s\n", msg.c_str());
     return true;
   }
 
@@ -478,6 +486,7 @@ private:
 
   unsigned _sampleRate, _blockFrames;
   std::string _romDir;
+  ResetMode _resetMode;
   float _gainLin = 1.0f;
   std::vector<float> _rendered;
   std::atomic<bool> _running{false};
@@ -520,6 +529,7 @@ int main(int argc, char **argv) {
   unsigned block = 256;
   unsigned latency = 20;
   double gainDb = 0.0;
+  ResetMode resetMode = ResetMode::None;
 
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
@@ -550,6 +560,12 @@ int main(int argc, char **argv) {
     else if (a == "--block")         block = static_cast<unsigned>(std::stoul(need("--block")));
     else if (a == "--latency")       latency = static_cast<unsigned>(std::stoul(need("--latency")));
     else if (a == "--gain-db")       gainDb = std::stod(need("--gain-db"));
+    else if (a == "--reset") {
+      if (!parse_reset_mode(need("--reset"), resetMode)) {
+        std::fprintf(stderr, "emusc-winmidi: --reset must be gs or gm\n");
+        return 1;
+      }
+    }
     else if (a == "--list-midi-in")  { list_midi_in_devices(); return 0; }
     else if (a == "--list-wave-out") { list_wave_out_devices(); return 0; }
     else if (a == "--list-dsound-out") return DSoundOut::list_devices() ? 0 : 1;
@@ -573,7 +589,7 @@ int main(int argc, char **argv) {
   if (romDir.empty()) romDir = default_rom_dir();
 
   WinMidiDaemon daemon(device, romDir, midiIn, waveOutId, rate, block, latency, gainDb,
-                       audioApi, dsoundOutId);
+                       audioApi, dsoundOutId, resetMode);
   daemon.run();
   return 0;
 }
