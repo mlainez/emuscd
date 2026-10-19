@@ -30,6 +30,7 @@
 #ifndef DEVICE_PROFILE_H
 #define DEVICE_PROFILE_H
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
