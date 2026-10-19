@@ -120,6 +120,8 @@ public:
   void set_gm_mode(void);
   // Whether set_gm_mode() leaves anything different from a GS reset.
   bool has_gm_mode(void) const;
+  // Whether the device receives the GS Reset and the GS parameter map.
+  bool has_gs_mode(void) const;
   void set_map_mt32(void);
 
   // Temporary solution

@@ -739,6 +739,12 @@ bool device_has_gm_mode(const Device *device)
          device->voice_ops->gm_system_on;
 }
 
+bool device_has_gs_mode(const Device *device)
+{
+  return device && device->initialized &&
+         xp_profile(&device->renderer.rom)->sysexModelId == 0x42;
+}
+
 bool device_host_reset_enters_gm(const Device *device)
 {
   if (!device || !device->initialized)

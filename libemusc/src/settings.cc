@@ -676,6 +676,12 @@ bool Settings::has_gm_mode(void) const
 }
 
 
+bool Settings::has_gs_mode(void) const
+{
+  return !_ctrlRom.device()->gsScaleTuningOnly;
+}
+
+
 void Settings::set_gm_mode(void)
 {
   // "Turn General MIDI System On" sets every internal parameter to the

@@ -41,10 +41,11 @@ const char *USAGE =
 "  --device NAME       Device to emulate (default: sc88)\n"
 "                       Supported: sc55, sc55mkii, sc88, jv880, jv1080\n"
 "  --midi-in N          MIDI input device index (default: 0)\n"
-"  --reset MODE         gs or gm (default: gs). gm keeps every device that\n"
-"                        has a GM mode in it while emusc-winmidi runs,\n"
-"                        whatever SysEx it is sent; a device without one\n"
-"                        runs in GS\n"
+"  --reset MODE         gs or gm: keep every device in that mode while\n"
+"                        emusc-winmidi runs, whatever SysEx it is sent; a\n"
+"                        device without it is kept in the other one.\n"
+"                        Without it, devices start in GS and the MIDI\n"
+"                        stream may switch them\n"
 "  --audio-api API      Audio output API: auto, winmm or dsound (default:\n"
 "                        auto - DirectSound, falling back to WinMM if it\n"
 "                        cannot be opened; winmm/dsound force one, and a\n"
@@ -505,7 +506,7 @@ int main(int argc, char **argv) {
   unsigned block = 256;
   unsigned latency = 20;
   double gainDb = 0.0;
-  ResetMode resetMode = ResetMode::GS;
+  ResetMode resetMode = ResetMode::None;
 
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];

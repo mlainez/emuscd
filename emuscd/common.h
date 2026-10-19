@@ -21,9 +21,10 @@ using emusc_tools::default_rom_dir;
 using emusc_tools::gain_db_to_linear;
 using emusc_tools::apply_gain;
 
-// --reset: the mode every device this daemon loads is powered on in, kept
-// for as long as it runs, across device switches.
-enum class ResetMode { GS, GM };
+// --reset: the mode every device this daemon loads is powered on in and
+// locked to, for as long as it runs, across device switches. None, without
+// --reset, powers it on in GS and leaves the mode to the stream.
+enum class ResetMode { None, GS, GM };
 
 inline bool parse_reset_mode(const std::string &s, ResetMode &out) {
   if (s == "gs") { out = ResetMode::GS; return true; }
@@ -31,42 +32,58 @@ inline bool parse_reset_mode(const std::string &s, ResetMode &out) {
   return false;
 }
 
-// What power_on() left the device in.
-enum class PowerOnState { GS, GMLocked, GMUnavailable };
+// What power_on() did: which mode the device is locked in, if any, and
+// whether that is the one --reset asked for.
+struct PowerOnState {
+  ResetMode asked = ResetMode::None;
+  ResetMode locked = ResetMode::None;
+};
 
 // The power-on reset, which is what the hardware does when it is switched on.
 // It must follow set_audio_format(), which is where the parts are
 // instantiated and the SC-88 and JV-1080 engines are opened: before that the
-// reset has nothing to act on, and has_gm_mode() nothing to ask.
+// reset has nothing to act on, and has_gs_mode()/has_gm_mode() nothing to ask.
 //
-// GM asks for a GM-only device: the reset enters GM mode and the lock keeps it
-// there whatever SysEx arrives. A device without a GM mode is reset into GS
-// instead, its default.
+// A device without the mode asked for is locked in the other one instead, and
+// a device with neither runs unlocked in the state a GS reset leaves it in -
+// its own default.
 inline PowerOnState power_on(EmuSC::Synth &synth, ResetMode mode) {
   using SoundMap = EmuSC::Synth::SoundMap;
-  if (mode == ResetMode::GM && synth.has_gm_mode()) {
-    synth.reset(SoundMap::GS_GM, true);
-    synth.set_gm_locked(true);
-    return PowerOnState::GMLocked;
+  using ModeLock = EmuSC::Synth::ModeLock;
+  PowerOnState st;
+  st.asked = mode;
+  if (mode != ResetMode::None) {
+    const bool gs = synth.has_gs_mode(), gm = synth.has_gm_mode();
+    if (mode == ResetMode::GM)
+      st.locked = gm ? ResetMode::GM : gs ? ResetMode::GS : ResetMode::None;
+    else
+      st.locked = gs ? ResetMode::GS : gm ? ResetMode::GM : ResetMode::None;
   }
-  synth.reset(SoundMap::GS, true);
-  return mode == ResetMode::GM ? PowerOnState::GMUnavailable : PowerOnState::GS;
+  synth.reset(st.locked == ResetMode::GM ? SoundMap::GS_GM : SoundMap::GS, true);
+  synth.set_mode_lock(st.locked == ResetMode::GM ? ModeLock::GM
+                      : st.locked == ResetMode::GS ? ModeLock::GS
+                      : ModeLock::None);
+  return st;
 }
 
-// The line a daemon prints after power_on(), empty when there is nothing to
-// say. `prog` names the daemon, `dev` the device.
-inline std::string power_on_message(PowerOnState state, const std::string &prog,
+// The notice a daemon prints after power_on(), empty when --reset was not
+// given. `prog` names the daemon, `dev` the device.
+inline std::string power_on_message(const PowerOnState &st,
+                                    const std::string &prog,
                                     const std::string &dev) {
-  switch (state) {
-  case PowerOnState::GMLocked:
-    return prog + ": " + dev + " is in GM mode and stays in it while " + prog +
-           " runs, whatever SysEx it is sent";
-  case PowerOnState::GMUnavailable:
-    return prog + ": no GM mode available on " + dev +
-           ", so GS was selected as the default";
-  default:
+  auto name = [](ResetMode m) { return m == ResetMode::GM ? "GM" : "GS"; };
+  if (st.asked == ResetMode::None)
     return "";
-  }
+  if (st.locked == ResetMode::None)
+    return prog + ": neither GS nor GM mode is available on " + dev +
+           ", so it runs in its own default mode";
+  const std::string stays = " stays in " + std::string(name(st.locked)) +
+                            " mode while " + prog +
+                            " runs, whatever SysEx it is sent";
+  if (st.locked == st.asked)
+    return prog + ": " + dev + stays;
+  return prog + ": no " + name(st.asked) + " mode available on " + dev +
+         ", so " + name(st.locked) + " was selected as the default; it" + stays;
 }
 
 inline bool device_supported(const std::string &dev) {

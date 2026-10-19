@@ -1,16 +1,18 @@
 /* SPDX-License-Identifier: CC0-1.0 */
 
-/* Synth::has_gm_mode() and Synth::set_gm_locked().
+/* Synth::has_gs_mode(), Synth::has_gm_mode() and Synth::set_mode_lock().
  *
  * On the SC-55mkII, GM mode is GS with Rx.BankSelect and Rx.NRPN off on every
  * part (Settings::set_gm_mode()), which shows as a bank select that no longer
- * reaches the tone. A GS Reset turns both back on, and so can a GS DT1 to a
- * part's Rx.BankSelect. Under the GM lock neither may: the GS Reset resets
- * into GM instead, and the switch stays off. Each locked case is run unlocked
- * first, so the test shows the lock, not the message, is what holds GM.
+ * reaches the tone. A GM System On enters it; a GS Reset leaves it, and so
+ * can a GS DT1 to a part's Rx.BankSelect. Locked in GS, the GM System On may
+ * not enter it; locked in GM, neither of the others may leave it. Each locked
+ * case is run unlocked first, so the test shows the lock, not the message, is
+ * what holds the mode.
  *
- * has_gm_mode() is checked on every device whose ROMs are given: true on the
- * SC-55mkII and JV-1080, false on the SC-55, JV-880 and SC-88.
+ * Both queries are checked on every device whose ROMs are given:
+ * has_gs_mode() true on the SC-55, SC-55mkII and SC-88; has_gm_mode() true on
+ * the SC-55mkII and JV-1080.
  *
  *   SC55MKII_CONTROL_ROM, SC55MKII_CPU_ROM, SC55MKII_WAVE_ROMS
  *   SC55_CONTROL_ROM,     SC55_CPU_ROM,     SC55_WAVE_ROMS
@@ -39,6 +41,7 @@
 namespace {
 
 using SoundMap = EmuSC::Synth::SoundMap;
+using ModeLock = EmuSC::Synth::ModeLock;
 const uint32_t kRate = 32000;
 
 std::vector<std::string> split_commas(const std::string &s)
@@ -153,12 +156,12 @@ bool in_gs(EmuSC::Synth &s)
          rx_on(s, EmuSC::PatchParam::RxNRPN);
 }
 
-std::unique_ptr<EmuSC::Synth> power_on(Roms &r, SoundMap map, bool lock)
+std::unique_ptr<EmuSC::Synth> power_on(Roms &r, SoundMap map, ModeLock lock)
 {
   std::unique_ptr<EmuSC::Synth> s(new EmuSC::Synth(*r.ctrl, *r.wave));
   s->set_audio_format(kRate, 2);
   s->reset(map, true);
-  s->set_gm_locked(lock);
+  s->set_mode_lock(lock);
   run(*s);
   return s;
 }
@@ -166,16 +169,14 @@ std::unique_ptr<EmuSC::Synth> power_on(Roms &r, SoundMap map, bool lock)
 void test_sc55mkii(Roms &r)
 {
   {
-    std::unique_ptr<EmuSC::Synth> s = power_on(r, SoundMap::GS, false);
-    assert(s->has_gm_mode());
-    assert(!s->gm_locked());
+    std::unique_ptr<EmuSC::Synth> s = power_on(r, SoundMap::GS, ModeLock::None);
+    assert(s->has_gs_mode() && s->has_gm_mode());
+    assert(s->mode_lock() == ModeLock::None);
     assert(in_gs(*s));
     assert(bank_after_select(*s) == 8);
-  }
 
-  /* Unlocked: GM mode holds until a GS Reset or a DT1 undoes it. */
-  {
-    std::unique_ptr<EmuSC::Synth> s = power_on(r, SoundMap::GS_GM, false);
+    /* Unlocked: GM System On enters GM, a GS Reset or a DT1 leaves it. */
+    sysex(*s, kGmOn);
     assert(in_gm(*s));
     assert(bank_after_select(*s) == 0);
 
@@ -190,10 +191,29 @@ void test_sc55mkii(Roms &r)
     assert(bank_after_select(*s) == 8);
   }
 
-  /* Locked: neither does. */
+  /* Locked in GS: GM System On resets, but into GS. */
   {
-    std::unique_ptr<EmuSC::Synth> s = power_on(r, SoundMap::GS_GM, true);
-    assert(s->gm_locked());
+    std::unique_ptr<EmuSC::Synth> s = power_on(r, SoundMap::GS, ModeLock::GS);
+    assert(s->mode_lock() == ModeLock::GS);
+
+    const uint8_t level = s->get_param(EmuSC::PatchParam::PartLevel, 0);
+    sysex(*s, gs_dt1(0x40, 0x11, 0x19, { (uint8_t) (level ^ 0x40) }));
+    assert(s->get_param(EmuSC::PatchParam::PartLevel, 0) == (level ^ 0x40));
+    sysex(*s, kGmOn);
+    assert(s->get_param(EmuSC::PatchParam::PartLevel, 0) == level);
+    assert(in_gs(*s));
+    assert(bank_after_select(*s) == 8);
+
+    /* Unlocking hands the mode back to the stream. */
+    s->set_mode_lock(ModeLock::None);
+    sysex(*s, kGmOn);
+    assert(in_gm(*s));
+  }
+
+  /* Locked in GM: neither the GS Reset nor the DT1 leaves it. */
+  {
+    std::unique_ptr<EmuSC::Synth> s = power_on(r, SoundMap::GS_GM, ModeLock::GM);
+    assert(s->mode_lock() == ModeLock::GM);
     assert(in_gm(*s));
 
     sysex(*s, kGsReset);
@@ -213,15 +233,14 @@ void test_sc55mkii(Roms &r)
     assert(s->get_param(EmuSC::PatchParam::PartLevel, 0) == level);
     assert(in_gm(*s));
 
-    /* Unlocking hands GS back to the stream. */
-    s->set_gm_locked(false);
+    s->set_mode_lock(ModeLock::None);
     sysex(*s, kGsReset);
     assert(in_gs(*s));
     assert(bank_after_select(*s) == 8);
   }
 }
 
-void check_has_gm_mode(const char *prefix, bool expected, int &checked)
+void check_modes(const char *prefix, bool gs, bool gm, int &checked)
 {
   Roms r;
   if (!load(prefix, r))
@@ -229,9 +248,10 @@ void check_has_gm_mode(const char *prefix, bool expected, int &checked)
   EmuSC::Synth s(*r.ctrl, *r.wave);
   s.set_audio_format(kRate, 2);
   s.reset(SoundMap::GS, true);
-  if (s.has_gm_mode() != expected) {
-    std::cerr << prefix << ": has_gm_mode() is " << s.has_gm_mode()
-              << ", expected " << expected << std::endl;
+  if (s.has_gs_mode() != gs || s.has_gm_mode() != gm) {
+    std::cerr << prefix << ": has_gs_mode() " << s.has_gs_mode()
+              << ", has_gm_mode() " << s.has_gm_mode() << "; expected "
+              << gs << ", " << gm << std::endl;
     assert(false);
   }
   checked++;
@@ -247,11 +267,11 @@ int main(void)
   test_sc55mkii(mk2);
 
   int checked = 0;
-  check_has_gm_mode("SC55", false, checked);
-  check_has_gm_mode("JV880", false, checked);
-  check_has_gm_mode("SC88", false, checked);
-  check_has_gm_mode("JV1080", true, checked);
-  std::cout << "has_gm_mode() checked on " << checked
+  check_modes("SC55", true, false, checked);
+  check_modes("JV880", false, false, checked);
+  check_modes("SC88", true, false, checked);
+  check_modes("JV1080", false, true, checked);
+  std::cout << "has_gs_mode(), has_gm_mode() checked on " << checked
             << " more device(s)" << std::endl;
   return 0;
 }

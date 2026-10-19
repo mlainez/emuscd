@@ -823,7 +823,7 @@ void Synth::_apply_midi_sysex(uint8_t *data, uint16_t length)
       return;
 
     midiMutex.lock();
-    reset(SoundMap::GS_GM, true);
+    reset(_modeLock == ModeLock::GS ? SoundMap::GS : SoundMap::GS_GM, true);
     midiMutex.unlock();
     return;
   }
@@ -925,7 +925,7 @@ void Synth::_apply_midi_sysex(uint8_t *data, uint16_t length)
 
     // GM mode is GS with some receive switches off, and both a GS Reset and
     // a DT1 to those switches turn them back on: put them back.
-    if (_gmLocked)
+    if (_modeLock == ModeLock::GM)
       _settings->set_gm_mode();
   }
 
@@ -1213,6 +1213,14 @@ void Synth::panic(void)
 }
 
 
+bool Synth::has_gs_mode(void) const
+{
+  if (_ctrlRom.uses_xp_engine())
+    return Xp::device_has_gs_mode(_xpDevice);
+  return _settings->has_gs_mode();
+}
+
+
 bool Synth::has_gm_mode(void) const
 {
   if (_ctrlRom.uses_xp_engine())
@@ -1221,9 +1229,9 @@ bool Synth::has_gm_mode(void) const
 }
 
 
-void Synth::set_gm_locked(bool locked)
+void Synth::set_mode_lock(ModeLock lock)
 {
-  _gmLocked = locked;
+  _modeLock = lock;
 }
 
 

@@ -428,7 +428,7 @@ int main(int argc, char* argv[]) {
   bool stats = false;
   int rt_priority = 0;
   double gain_db = 0.0;
-  ResetMode reset_mode = ResetMode::GS;
+  ResetMode reset_mode = ResetMode::None;
 
   for (int i = 1; i < argc; i++) {
     std::string arg = argv[i];
@@ -490,10 +490,11 @@ int main(int argc, char* argv[]) {
           << "Options:\n"
           << "  --device NAME       Device to emulate (default: sc88)\n"
           << "                       Supported: sc55, sc55mkii, sc88, jv880, jv1080\n"
-          << "  --reset MODE        gs or gm (default: gs). gm keeps every device\n"
-          << "                       that has a GM mode in it while emuscd runs,\n"
-          << "                       whatever SysEx it is sent; a device without\n"
-          << "                       one runs in GS\n"
+          << "  --reset MODE        gs or gm: keep every device in that mode while\n"
+          << "                       emuscd runs, whatever SysEx it is sent; a\n"
+          << "                       device without it is kept in the other one.\n"
+          << "                       Without it, devices start in GS and the MIDI\n"
+          << "                       stream may switch them\n"
           << "  --name NAME         ALSA MIDI port name (default: emuscd)\n"
           << "  --pcm DEVICE        ALSA PCM output device (default: default)\n"
           << "  --list-pcm          List ALSA PCM devices and exit\n"

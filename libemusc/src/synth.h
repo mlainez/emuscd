@@ -139,21 +139,27 @@ public:
 
   void reset(SoundMap sm, bool resetParts = false);
 
+  // Whether the loaded device has a GS mode: whether it receives the GS
+  // Reset and the GS parameter map.
+  bool has_gs_mode(void) const;
   // Whether the loaded device has a GM mode that differs from its GS one,
   // i.e. whether reset(SoundMap::GS_GM) leaves it anywhere a GS reset does
-  // not. Asks the engine, which for the SC-88 and JV-1080 exists only from
-  // set_audio_format() on: call it after that.
+  // not.
+  // Both ask the engine, which for the SC-88 and JV-1080 exists only from
+  // set_audio_format() on: call them after that.
   bool has_gm_mode(void) const;
 
-  // While locked, the device stays in GM mode whatever SysEx it receives: a
-  // GS reset resets it into GM instead of GS, and a parameter write cannot
-  // turn GM's receive switches back on. For a host that offers a GM-only
-  // mode. It does not itself enter GM: reset(SoundMap::GS_GM) does that.
-  // Off by default, and meaningless on a device without has_gm_mode(). The
-  // XP engine has no SysEx path out of GM mode, so only the GP engine needs
-  // and reads it.
-  void set_gm_locked(bool locked);
-  bool gm_locked(void) const { return _gmLocked; }
+  // A mode lock keeps the device in one mode whatever SysEx it receives, for
+  // a host that offers a GS-only or GM-only mode. Locked in GS, a GM System
+  // On resets the device into GS. Locked in GM, a GS Reset resets it into
+  // GM, and a parameter write cannot turn GM's receive switches back on. It
+  // does not itself enter the mode: reset() does that. None, the default,
+  // leaves the mode to the stream. A lock on a mode the device does not have
+  // is meaningless. The XP engine has no SysEx path from one of its modes to
+  // the other, so only the GP engine needs and reads it.
+  enum class ModeLock { None, GS, GM };
+  void set_mode_lock(ModeLock lock);
+  ModeLock mode_lock(void) const { return _modeLock; }
 
   // Silences the device whatever it is and whatever it was sent: queued MIDI
   // is dropped, every voice of every part is cut, pedals are released and
@@ -227,7 +233,7 @@ private:
 private:
   Settings *_settings = nullptr;
 
-  bool _gmLocked = false;
+  ModeLock _modeLock = ModeLock::None;
 
   // The SC-88 is not rendered by the Part and Note path: its engine reads the
   // control ROM itself and renders a stereo frame at a time off its own
