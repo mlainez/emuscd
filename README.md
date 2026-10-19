@@ -249,8 +249,9 @@ MIDI cable (loopMIDI on Windows 7+, Maple Virtual MIDI Cable on 95/98/ME/2000/XP
 then point `--midi-in` at that port:
 
 ```bash
-emusc-winmidi --device sc55mkii --list-midi-in     # find the port number
+emusc-winmidi --device sc55mkii --list-midi-in     # find the port
 emusc-winmidi --device sc55mkii --midi-in 1
+emusc-winmidi --device sc55mkii --midi-in "loopMIDI Port"
 ```
 
 `emusc-winmidi --help` covers `--wave-out`, `--rate`, `--block` and `--latency`,
@@ -271,8 +272,10 @@ from this project's own `install()` rules: `bin/` holds `emusc-render` plus
 `libemusc` library (`.so`/`.dll`, plus the Windows import library) for
 anyone who wants to link against it directly rather than use the bundled
 tools; `include/emusc/` and `lib/pkgconfig/` hold its headers and
-pkg-config file. Each nightly publish replaces the previous release
-outright, so it always reflects exactly the latest push rather than
+pkg-config file. The Linux archives are built on Debian bookworm, so they
+run on any distribution with glibc 2.36 or newer. Each nightly publish
+replaces the previous release outright, so it always reflects exactly the
+latest push rather than
 accumulating older builds' files alongside newer ones.
 
 ## Hardware Floor (Windows, Untested)
@@ -478,6 +481,8 @@ Common options:
   --reset MODE        gs or gm: keep every device in that mode whatever SysEx it is
                       sent; one without it is kept in the other (default: neither)
   --name NAME         ALSA MIDI port name (default: emuscd)
+  --midi-in PORT      Also connect from an existing MIDI input: index, or name or part of one
+  --list-midi-in      List MIDI input ports and exit
   --pcm DEVICE        ALSA PCM output device (default: default)
   --list-pcm          List ALSA PCM devices and exit
   --rom-dir DIR       Directory holding device ROM files (default:
@@ -503,6 +508,7 @@ You can then connect MIDI input using `aconnect`:
 ```bash
 aconnect -l                          # List ALSA ports
 aconnect 24:0 'emuscd':0             # Connect a sequencer port to emuscd
+emuscd --midi-in "Your Keyboard"     # ...or have emuscd connect it at startup
 aplaymidi -p 'emuscd' song.mid       # Play a MIDI file
 ```
 
@@ -527,13 +533,14 @@ directory, if neither is given), then start it:
 set EMUSCD_ROM_DIR=C:\path\to\roms
 emusc-winmidi.exe --list-midi-in
 emusc-winmidi.exe --device sc88 --midi-in 1
+emusc-winmidi.exe --device sc88 --midi-in "loopMIDI Port"
 ```
 
 Common options:
 
 ```
   --device NAME       Device to emulate (default: sc88); sc55, sc55mkii, sc88, jv880, jv1080
-  --midi-in N          MIDI input device index (default: 0)
+  --midi-in PORT       MIDI input device: index, or name or part of one (default: 0)
   --reset MODE         gs or gm: keep every device in that mode whatever SysEx it is
                        sent; one without it is kept in the other (default: neither)
   --wave-out N         Wave output device index (default: system default)

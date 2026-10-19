@@ -51,6 +51,8 @@ emuscd --device sc88 --name "My Synth"
 --reset MODE        gs or gm: keep every device in that mode whatever SysEx it is
                     sent; one without it is kept in the other (default: neither)
 --name NAME         ALSA MIDI port name (default: emuscd)
+--midi-in PORT      Also connect from an existing MIDI input: index, or name or part of one
+--list-midi-in      List MIDI input ports and exit
 --pcm DEVICE        ALSA PCM output device (default: default)
 --list-pcm          List ALSA PCM devices and exit
 --rom-dir DIR       Directory holding device ROM files (default:
@@ -80,6 +82,7 @@ emuscd --device sc88 --name "My Synth"
 ```bash
 aconnect -l                          # List ALSA ports
 aconnect "Your Keyboard" "emuscd"    # Connect your keyboard to emuscd
+emuscd --midi-in "Your Keyboard"     # ...or have emuscd connect it at startup
 aplaymidi -p 'emuscd' song.mid       # Play a MIDI file
 ```
 
@@ -141,13 +144,14 @@ then point `--midi-in` at that port.
 ```bat
 emusc-winmidi.exe --list-midi-in
 emusc-winmidi.exe --device sc88 --midi-in 1
+emusc-winmidi.exe --device sc88 --midi-in "loopMIDI Port"
 ```
 
 ### Options
 
 ```
 --device NAME       Device to emulate (default: sc88); sc55, sc55mkii, sc88, jv880, jv1080
---midi-in N          MIDI input device index (default: 0)
+--midi-in PORT       MIDI input device: index, or name or part of one (default: 0)
 --reset MODE         gs or gm: keep every device in that mode whatever SysEx it is
                      sent; one without it is kept in the other (default: neither)
 --audio-api API      Audio output API: auto, winmm or dsound (default: auto,
