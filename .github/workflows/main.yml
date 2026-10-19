@@ -108,8 +108,10 @@ jobs:
     # library + headers + pkg-config file into lib/ and include/, licensing
     # docs into share/doc/), so the release bundle's contents track those
     # rules instead of a second, hand-maintained file list here.
+    # $GITHUB_WORKSPACE, not ${{github.workspace}}: inside a job container the
+    # latter is still the runner's host path, which the container doesn't see.
     - name: Stage install tree
-      run: cmake --install build --prefix "${{github.workspace}}/release/emusc-${{matrix.name}}"
+      run: cmake --install build --prefix "$GITHUB_WORKSPACE/release/emusc-${{matrix.name}}"
       shell: bash
 
     # Named per architecture (emusc-render.exe / emusc-render32.exe, matching
