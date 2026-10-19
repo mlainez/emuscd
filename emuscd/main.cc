@@ -21,6 +21,7 @@
 #include <sched.h>
 #include <sys/mman.h>
 #include "common.h"
+#include "midi_port_match.h"
 #include "../libemusc/src/synth.h"
 #include "../libemusc/src/control_rom.h"
 #include "../libemusc/src/wave_rom.h"
@@ -55,6 +56,56 @@ void list_pcm_devices() {
     free(desc);
   }
   snd_device_name_free_hint(hints);
+}
+
+// A sequencer port another client lets this one read from, as `aconnect -i`
+// lists them. Named "<client>: <port>" so either half matches --midi-in.
+struct SeqSource {
+  int client, port;
+  std::string name;
+};
+
+std::vector<SeqSource> list_seq_sources(snd_seq_t *seq) {
+  std::vector<SeqSource> out;
+  const int self = snd_seq_client_id(seq);
+  const unsigned caps = SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ;
+  snd_seq_client_info_t *ci;
+  snd_seq_port_info_t *pi;
+  snd_seq_client_info_alloca(&ci);
+  snd_seq_port_info_alloca(&pi);
+  snd_seq_client_info_set_client(ci, -1);
+  while (snd_seq_query_next_client(seq, ci) >= 0) {
+    const int client = snd_seq_client_info_get_client(ci);
+    // The system client's ports are the timer and announcements, not MIDI.
+    if (client == SND_SEQ_CLIENT_SYSTEM || client == self)
+      continue;
+    snd_seq_port_info_set_client(pi, client);
+    snd_seq_port_info_set_port(pi, -1);
+    while (snd_seq_query_next_port(seq, pi) >= 0) {
+      const unsigned c = snd_seq_port_info_get_capability(pi);
+      if ((c & caps) != caps || (c & SND_SEQ_PORT_CAP_NO_EXPORT))
+        continue;
+      out.push_back({client, snd_seq_port_info_get_port(pi),
+                     std::string(snd_seq_client_info_get_name(ci)) + ": " +
+                       snd_seq_port_info_get_name(pi)});
+    }
+  }
+  return out;
+}
+
+void list_midi_in_devices() {
+  snd_seq_t *seq;
+  if (snd_seq_open(&seq, "default", SND_SEQ_OPEN_INPUT, 0) < 0) {
+    std::cerr << "emuscd: could not open the ALSA sequencer" << std::endl;
+    return;
+  }
+  std::vector<SeqSource> src = list_seq_sources(seq);
+  if (src.empty())
+    std::cout << "(no MIDI input ports found)" << std::endl;
+  for (size_t i = 0; i < src.size(); i++)
+    std::cout << i << ": " << src[i].name << " (" << src[i].client << ":"
+              << src[i].port << ")" << std::endl;
+  snd_seq_close(seq);
 }
 
 }  // namespace
@@ -128,11 +179,13 @@ public:
                unsigned int requested_rate, unsigned int latency_ms,
                unsigned int block, unsigned int threads,
                const std::vector<unsigned>& workers, bool stats,
-               double gain_db)
+               double gain_db, const std::string& midi_in)
       : sample_rate(requested_rate), block_frames(block),
         render_threads(threads), worker_cpus(workers), show_stats(stats),
         gain_lin(gain_db_to_linear(gain_db)), rom_dir(rom_directory) {
     init_alsa_midi(port_name);
+    if (!midi_in.empty())
+      connect_midi_in(midi_in);
     init_alsa_audio(pcm_device, latency_ms);
     if (!load_device(dev)) {
       std::cerr << "emuscd: failed to load initial device '" << dev << "'"
@@ -169,6 +222,47 @@ public:
     }
     snd_seq_nonblock(seq, 1);
     std::cout << "ALSA MIDI input opened: " << port_name << std::endl;
+  }
+
+  // Subscribes this client's port to an existing source, as `aconnect` would,
+  // for a source such as a USB keyboard that is not going to connect to it.
+  // Programs can still connect to the port by --name as well.
+  void connect_midi_in(const std::string& want) {
+    std::vector<SeqSource> src = list_seq_sources(seq);
+    if (src.empty()) {
+      std::cerr << "emuscd: --midi-in: no MIDI input ports available"
+                << std::endl;
+      exit(1);
+    }
+    std::vector<std::string> names;
+    for (const SeqSource& s : src) names.push_back(s.name);
+    MidiPortMatch m = match_midi_port(want, names);
+    if (!m.candidates.empty()) {
+      std::cerr << "emuscd: --midi-in '" << want << "' matches more than one "
+                << "MIDI input:" << std::endl;
+      for (int i : m.candidates)
+        std::cerr << "  " << i << ": " << names[i] << std::endl;
+      exit(1);
+    }
+    if (m.isIndex && (m.index < 0 || (size_t) m.index >= src.size())) {
+      std::cerr << "emuscd: --midi-in " << want << " out of range (0.."
+                << src.size() - 1 << "); see --list-midi-in" << std::endl;
+      exit(1);
+    }
+    if (m.index < 0) {
+      std::cerr << "emuscd: --midi-in '" << want << "' matches no MIDI input; "
+                << "see --list-midi-in" << std::endl;
+      exit(1);
+    }
+    const SeqSource& s = src[m.index];
+    int err = snd_seq_connect_from(seq, seq_port, s.client, s.port);
+    if (err < 0) {
+      std::cerr << "emuscd: could not connect from '" << s.name << "': "
+                << snd_strerror(err) << std::endl;
+      exit(1);
+    }
+    std::cout << "MIDI input connected: " << s.name << " (" << s.client << ":"
+              << s.port << ")" << std::endl;
   }
 
   void init_alsa_audio(const std::string& pcm_device, unsigned int latency_ms) {
@@ -415,6 +509,7 @@ int main(int argc, char* argv[]) {
 
   std::string device = "sc88";
   std::string port_name = "emuscd";
+  std::string midi_in;
   std::string pcm_device = "default";
   std::string rom_dir;
   unsigned int rate = 48000;
@@ -445,6 +540,11 @@ int main(int argc, char* argv[]) {
       rom_dir = need("--rom-dir");
     } else if (arg == "--list-pcm") {
       list_pcm_devices();
+      return 0;
+    } else if (arg == "--midi-in") {
+      midi_in = need("--midi-in");
+    } else if (arg == "--list-midi-in") {
+      list_midi_in_devices();
       return 0;
     } else if (arg == "--rate") {
       rate = static_cast<unsigned int>(std::stoul(need("--rate")));
@@ -482,6 +582,10 @@ int main(int argc, char* argv[]) {
           << "  --device NAME       Device to emulate (default: sc88)\n"
           << "                       Supported: sc55, sc55mkii, sc88, jv880, jv1080\n"
           << "  --name NAME         ALSA MIDI port name (default: emuscd)\n"
+          << "  --midi-in PORT      Also connect from an existing MIDI input, such\n"
+          << "                       as a USB keyboard: an index, or a name or any\n"
+          << "                       part of one, any case. See --list-midi-in\n"
+          << "  --list-midi-in      List MIDI input ports and exit\n"
           << "  --pcm DEVICE        ALSA PCM output device (default: default)\n"
           << "  --list-pcm          List ALSA PCM devices and exit\n"
           << "  --rom-dir DIR       Directory holding device ROM files (default:\n"
@@ -560,7 +664,7 @@ int main(int argc, char* argv[]) {
   try {
     EmuscdDaemon daemon(device, port_name, pcm_device, rom_dir, rate,
                          latency_ms, block, threads, worker_cpus, stats,
-                         gain_db);
+                         gain_db, midi_in);
     daemon.run();
   } catch (const std::exception& e) {
     std::cerr << "Fatal error: " << e.what() << std::endl;

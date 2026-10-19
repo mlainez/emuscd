@@ -4,7 +4,7 @@
 // MIDI port of its own - unlike ALSA's "virtual:" ports, WinMM's midiIn API
 // only opens an EXISTING one - so a virtual MIDI cable (loopMIDI on Windows
 // 7+, Maple Virtual MIDI Cable on 95/98/ME) is what a sequencer or game
-// connects to; this process then opens that port by device index.
+// connects to; this process then opens that port by index or by name.
 
 #include <windows.h>
 #include <mmsystem.h>
@@ -23,6 +23,7 @@
 
 #include "audio_out_dsound.h"
 #include "common.h"
+#include "midi_port_match.h"
 #include "../libemusc/src/synth.h"
 #include "../libemusc/src/control_rom.h"
 #include "../libemusc/src/wave_rom.h"
@@ -40,7 +41,8 @@ const char *USAGE =
 "Options:\n"
 "  --device NAME       Device to emulate (default: sc88)\n"
 "                       Supported: sc55, sc55mkii, sc88, jv880, jv1080\n"
-"  --midi-in N          MIDI input device index (default: 0)\n"
+"  --midi-in PORT       MIDI input device: an index, or a name or any part\n"
+"                       of one, any case (default: 0). See --list-midi-in\n"
 "  --audio-api API      Audio output API: auto, winmm or dsound (default:\n"
 "                        auto - DirectSound, falling back to WinMM if it\n"
 "                        cannot be opened; winmm/dsound force one, and a\n"
@@ -74,7 +76,8 @@ const char *USAGE =
 "\n"
 "emusc-winmidi does not create a MIDI port itself. Route MIDI into it with\n"
 "a virtual MIDI cable (loopMIDI, or Maple Virtual MIDI Cable on Windows\n"
-"95/98/ME), then pick that port with --midi-in.\n";
+"95/98/ME), then pick that port with --midi-in, e.g.\n"
+"  emusc-winmidi --midi-in \"loopMIDI Port\"\n";
 
 // Bytes 0-2 of MIM_DATA's packed dwParam1 are the status byte and up to two
 // data bytes, already driver-normalised: WinMM has resolved running status
@@ -117,7 +120,7 @@ void list_wave_out_devices() {
 class WinMidiDaemon {
 public:
   WinMidiDaemon(const std::string &dev, const std::string &romDir,
-                int midiInId, int waveOutId, unsigned rate, unsigned block,
+                const std::string &midiIn, int waveOutId, unsigned rate, unsigned block,
                 unsigned latencyMs, double gainDb, AudioApi api,
                 int dsoundOutId)
       : _sampleRate(rate), _blockFrames(block), _romDir(romDir),
@@ -129,7 +132,7 @@ public:
                    dev.c_str());
       std::exit(2);
     }
-    open_midi_in(midiInId);
+    open_midi_in(midiIn);
     if (api == AudioApi::WinMM || !open_dsound(dsoundOutId, latencyMs)) {
       if (api == AudioApi::DSound) std::exit(1);
       if (api == AudioApi::Auto)
@@ -193,16 +196,36 @@ public:
     return true;
   }
 
-  void open_midi_in(int id) {
+  void open_midi_in(const std::string &want) {
     UINT n = midiInGetNumDevs();
     if (n == 0) {
       std::fprintf(stderr, "emusc-winmidi: no MIDI input devices available - "
                    "install a virtual MIDI cable (loopMIDI/Maple) first\n");
       std::exit(1);
     }
-    if (id < 0 || static_cast<UINT>(id) >= n) {
-      std::fprintf(stderr, "emusc-winmidi: --midi-in %d out of range (0..%u); "
-                   "see --list-midi-in\n", id, n - 1);
+    std::vector<std::string> names(n);
+    for (UINT i = 0; i < n; i++) {
+      MIDIINCAPSA c{};
+      if (midiInGetDevCapsA(i, &c, sizeof(c)) == MMSYSERR_NOERROR)
+        names[i] = c.szPname;
+    }
+    MidiPortMatch m = match_midi_port(want, names);
+    if (!m.candidates.empty()) {
+      std::fprintf(stderr, "emusc-winmidi: --midi-in '%s' matches more than "
+                   "one MIDI input:\n", want.c_str());
+      for (int i : m.candidates)
+        std::fprintf(stderr, "  %d: %s\n", i, names[i].c_str());
+      std::exit(1);
+    }
+    int id = m.index;
+    if (m.isIndex && (id < 0 || static_cast<UINT>(id) >= n)) {
+      std::fprintf(stderr, "emusc-winmidi: --midi-in %s out of range (0..%u); "
+                   "see --list-midi-in\n", want.c_str(), n - 1);
+      std::exit(1);
+    }
+    if (id < 0) {
+      std::fprintf(stderr, "emusc-winmidi: --midi-in '%s' matches no MIDI "
+                   "input; see --list-midi-in\n", want.c_str());
       std::exit(1);
     }
     MIDIINCAPSA caps{};
@@ -489,7 +512,7 @@ int main(int argc, char **argv) {
 
   std::string device = "sc88";
   std::string romDir;
-  int midiInId = 0;
+  std::string midiIn = "0";
   int waveOutId = -1;
   int dsoundOutId = -1;
   AudioApi audioApi = AudioApi::Auto;
@@ -509,7 +532,7 @@ int main(int argc, char **argv) {
     };
     if      (a == "--device")        device = need("--device");
     else if (a == "--rom-dir")       romDir = need("--rom-dir");
-    else if (a == "--midi-in")       midiInId = std::stoi(need("--midi-in"));
+    else if (a == "--midi-in")       midiIn = need("--midi-in");
     else if (a == "--wave-out")      waveOutId = std::stoi(need("--wave-out"));
     else if (a == "--dsound-out")    dsoundOutId = std::stoi(need("--dsound-out"));
     else if (a == "--audio-api") {
@@ -549,7 +572,7 @@ int main(int argc, char **argv) {
 
   if (romDir.empty()) romDir = default_rom_dir();
 
-  WinMidiDaemon daemon(device, romDir, midiInId, waveOutId, rate, block, latency, gainDb,
+  WinMidiDaemon daemon(device, romDir, midiIn, waveOutId, rate, block, latency, gainDb,
                        audioApi, dsoundOutId);
   daemon.run();
   return 0;
