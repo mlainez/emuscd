@@ -477,6 +477,8 @@ Common options:
 ```
   --device NAME       Device to emulate (default: sc88); sc55, sc55mkii, sc88, jv880, jv1080
   --name NAME         ALSA MIDI port name (default: emuscd)
+  --midi-in PORT      Also connect from an existing MIDI input: index, or name or part of one
+  --list-midi-in      List MIDI input ports and exit
   --pcm DEVICE        ALSA PCM output device (default: default)
   --list-pcm          List ALSA PCM devices and exit
   --rom-dir DIR       Directory holding device ROM files (default:
@@ -502,6 +504,7 @@ You can then connect MIDI input using `aconnect`:
 ```bash
 aconnect -l                          # List ALSA ports
 aconnect 24:0 'emuscd':0             # Connect a sequencer port to emuscd
+emuscd --midi-in "Your Keyboard"     # ...or have emuscd connect it at startup
 aplaymidi -p 'emuscd' song.mid       # Play a MIDI file
 ```
 
