@@ -18,11 +18,21 @@ jobs:
     # cross-compiled from the same runner for the same reason there's no
     # separate runner OS for them: it's one job per architecture, not one job
     # per (OS, architecture) pair.
+    #
+    # The Linux legs build inside debian:bookworm rather than on the runner
+    # itself. A binary needs a glibc at least as new as the one it was linked
+    # against, and the runner's (2.39 on noble) is newer than what a 32-bit
+    # x86 or ARM machine typically still runs: Debian bookworm, glibc 2.36, is
+    # the last release with 32-bit x86 kernels. Linking against noble also
+    # pulls in __isoc23_strtol and friends (GLIBC_2.38), which GCC 13 picks
+    # for every strtol/strtoul call, so even code that uses nothing new gets
+    # the newer requirement.
     strategy:
       matrix:
         include:
           - name: linux-x64
             os: linux
+            container: debian:bookworm
             dep: 'build-essential cmake libasound2-dev'
           # 32-bit x86 Linux has no dedicated cross-compiler package: Debian/
           # Ubuntu expose it as a multilib target of the native amd64 gcc/g++
@@ -30,16 +40,19 @@ jobs:
           # package rather than a gcc-*-linux-gnu cross toolchain.
           - name: linux-x86
             os: linux
+            container: debian:bookworm
             foreign_arch: i386
             dep: 'build-essential cmake gcc-multilib g++-multilib libc6-dev-i386 libasound2-dev:i386'
             toolchain: cmake/toolchain-linux-i686.cmake
           - name: linux-arm64
             os: linux
+            container: debian:bookworm
             foreign_arch: arm64
             dep: 'cmake gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libasound2-dev:arm64'
             toolchain: cmake/toolchain-linux-arm64.cmake
           - name: linux-arm32
             os: linux
+            container: debian:bookworm
             foreign_arch: armhf
             dep: 'cmake gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf libasound2-dev:armhf'
             toolchain: cmake/toolchain-linux-armhf.cmake
@@ -58,6 +71,7 @@ jobs:
             exe_name: emusc-render32.exe
             winmidi_name: emusc-winmidi32.exe
     runs-on: ubuntu-latest
+    container: ${{matrix.container}}
     steps:
     - name: Checkout Repo
       uses: actions/checkout@v4
@@ -68,36 +82,15 @@ jobs:
     # packages that happen to produce Windows binaries.
     - name: Add foreign architecture
       if: matrix.foreign_arch != ''
-      run: sudo dpkg --add-architecture ${{matrix.foreign_arch}}
+      run: dpkg --add-architecture ${{matrix.foreign_arch}}
 
-    # i386 packages live on the same archive.ubuntu.com/security.ubuntu.com
-    # mirrors as amd64, so plain `dpkg --add-architecture i386` is enough.
-    # armhf and arm64 don't: they're "ports" architectures, hosted only on
-    # ports.ubuntu.com. The runner's default sources don't restrict which
-    # architecture they serve, so once dpkg knows about armhf/arm64, apt
-    # tries (and 404s on) those architectures on the amd64-only mirrors too -
-    # and having both the default sources and the new ports source offer the
-    # same (suite, component, arch) confuses apt's resolver into treating the
-    # foreign package as uninstallable, even though the ports copy fetched
-    # fine. Restricting the default sources to amd64 makes ports.ubuntu.com
-    # the sole provider of the foreign architecture.
-    - name: Add ports.ubuntu.com for ARM architectures
-      if: matrix.foreign_arch == 'armhf' || matrix.foreign_arch == 'arm64'
-      run: |
-        sudo sed -i '/^Types:/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
-        printf '%s\n' \
-          'Types: deb' \
-          'URIs: http://ports.ubuntu.com/ubuntu-ports' \
-          'Suites: noble noble-updates noble-backports noble-security' \
-          'Components: main universe restricted multiverse' \
-          'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
-          "Architectures: ${{matrix.foreign_arch}}" \
-          | sudo tee /etc/apt/sources.list.d/ports-${{matrix.foreign_arch}}.sources > /dev/null
-
+    # The Linux legs run as root inside their container, which has no sudo;
+    # the Windows legs run on the runner itself as an unprivileged user.
     - name: Install Dependencies
       run: |
-        sudo apt-get update
-        sudo apt-get install -y ${{matrix.dep}}
+        SUDO=$([ "$(id -u)" = 0 ] || echo sudo)
+        $SUDO apt-get update
+        $SUDO apt-get install -y ${{matrix.dep}}
 
     - name: Configure CMake (native)
       if: matrix.toolchain == ''

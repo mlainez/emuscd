@@ -271,8 +271,10 @@ from this project's own `install()` rules: `bin/` holds `emusc-render` plus
 `libemusc` library (`.so`/`.dll`, plus the Windows import library) for
 anyone who wants to link against it directly rather than use the bundled
 tools; `include/emusc/` and `lib/pkgconfig/` hold its headers and
-pkg-config file. Each nightly publish replaces the previous release
-outright, so it always reflects exactly the latest push rather than
+pkg-config file. The Linux archives are built on Debian bookworm, so they
+run on any distribution with glibc 2.36 or newer. Each nightly publish
+replaces the previous release outright, so it always reflects exactly the
+latest push rather than
 accumulating older builds' files alongside newer ones.
 
 ## Hardware Floor (Windows, Untested)
