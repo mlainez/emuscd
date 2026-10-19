@@ -139,13 +139,14 @@ then point `--midi-in` at that port.
 ```bat
 emusc-winmidi.exe --list-midi-in
 emusc-winmidi.exe --device sc88 --midi-in 1
+emusc-winmidi.exe --device sc88 --midi-in "loopMIDI Port"
 ```
 
 ### Options
 
 ```
 --device NAME       Device to emulate (default: sc88); sc55, sc55mkii, sc88, jv880, jv1080
---midi-in N          MIDI input device index (default: 0)
+--midi-in PORT       MIDI input device: index, or name or part of one (default: 0)
 --audio-api API      Audio output API: auto, winmm or dsound (default: auto,
                      DirectSound with WinMM fallback)
 --wave-out N         WinMM wave output device index (default: system default)

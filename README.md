@@ -249,8 +249,9 @@ MIDI cable (loopMIDI on Windows 7+, Maple Virtual MIDI Cable on 95/98/ME/2000/XP
 then point `--midi-in` at that port:
 
 ```bash
-emusc-winmidi --device sc55mkii --list-midi-in     # find the port number
+emusc-winmidi --device sc55mkii --list-midi-in     # find the port
 emusc-winmidi --device sc55mkii --midi-in 1
+emusc-winmidi --device sc55mkii --midi-in "loopMIDI Port"
 ```
 
 `emusc-winmidi --help` covers `--wave-out`, `--rate`, `--block` and `--latency`,
@@ -525,13 +526,14 @@ directory, if neither is given), then start it:
 set EMUSCD_ROM_DIR=C:\path\to\roms
 emusc-winmidi.exe --list-midi-in
 emusc-winmidi.exe --device sc88 --midi-in 1
+emusc-winmidi.exe --device sc88 --midi-in "loopMIDI Port"
 ```
 
 Common options:
 
 ```
   --device NAME       Device to emulate (default: sc88); sc55, sc55mkii, sc88, jv880, jv1080
-  --midi-in N          MIDI input device index (default: 0)
+  --midi-in PORT       MIDI input device: index, or name or part of one (default: 0)
   --wave-out N         Wave output device index (default: system default)
   --list-midi-in       List MIDI input devices and exit
   --list-wave-out      List wave output devices and exit
