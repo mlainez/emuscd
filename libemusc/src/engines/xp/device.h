@@ -236,6 +236,8 @@ void device_reset_controllers(Device *device);
  * message had arrived. False, with nothing changed, on a device that has
  * no GM mode - which includes every device on the shared firmware port. */
 bool device_gm_system_on(Device *device);
+/* Whether device_gm_system_on() would act: the device has a GM mode. */
+bool device_has_gm_mode(const Device *device);
 /* True on a device whose profile has a host reset enter GM mode; see
  * XpDeviceProfile::hostResetEntersGm. */
 bool device_host_reset_enters_gm(const Device *device);

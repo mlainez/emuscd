@@ -920,8 +920,14 @@ void Synth::_apply_midi_sysex(uint8_t *data, uint16_t length)
 //  _midi_input_sysex_RQ1(&data[5], length - 5 - 2); // Add reply data buffer
 
   // Data set 1 (DT1)
-  if (data[4] == 0x12)
+  if (data[4] == 0x12) {
     _midi_input_sysex_DT1(data[3], &data[5], length - 5 - 2);
+
+    // GM mode is GS with some receive switches off, and both a GS Reset and
+    // a DT1 to those switches turn them back on: put them back.
+    if (_gmLocked)
+      _settings->set_gm_mode();
+  }
 
   midiMutex.unlock();
 }
@@ -1204,6 +1210,20 @@ void Synth::panic(void)
     p.delete_all_notes();
     p.control_change(121, 0);
   }
+}
+
+
+bool Synth::has_gm_mode(void) const
+{
+  if (_ctrlRom.uses_xp_engine())
+    return Xp::device_has_gm_mode(_xpDevice);
+  return _settings->has_gm_mode();
+}
+
+
+void Synth::set_gm_locked(bool locked)
+{
+  _gmLocked = locked;
 }
 
 

@@ -118,6 +118,8 @@ public:
   // Reset all settings to default GS mode
   void reset();
   void set_gm_mode(void);
+  // Whether set_gm_mode() leaves anything different from a GS reset.
+  bool has_gm_mode(void) const;
   void set_map_mt32(void);
 
   // Temporary solution

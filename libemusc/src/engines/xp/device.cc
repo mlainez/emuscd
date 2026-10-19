@@ -733,6 +733,12 @@ bool device_gm_system_on(Device *device)
   return device->voice_ops->gm_system_on(device->voice_state);
 }
 
+bool device_has_gm_mode(const Device *device)
+{
+  return device && device->initialized && device->voice_ops &&
+         device->voice_ops->gm_system_on;
+}
+
 bool device_host_reset_enters_gm(const Device *device)
 {
   if (!device || !device->initialized)

@@ -139,6 +139,22 @@ public:
 
   void reset(SoundMap sm, bool resetParts = false);
 
+  // Whether the loaded device has a GM mode that differs from its GS one,
+  // i.e. whether reset(SoundMap::GS_GM) leaves it anywhere a GS reset does
+  // not. Asks the engine, which for the SC-88 and JV-1080 exists only from
+  // set_audio_format() on: call it after that.
+  bool has_gm_mode(void) const;
+
+  // While locked, the device stays in GM mode whatever SysEx it receives: a
+  // GS reset resets it into GM instead of GS, and a parameter write cannot
+  // turn GM's receive switches back on. For a host that offers a GM-only
+  // mode. It does not itself enter GM: reset(SoundMap::GS_GM) does that.
+  // Off by default, and meaningless on a device without has_gm_mode(). The
+  // XP engine has no SysEx path out of GM mode, so only the GP engine needs
+  // and reads it.
+  void set_gm_locked(bool locked);
+  bool gm_locked(void) const { return _gmLocked; }
+
   // Silences the device whatever it is and whatever it was sent: queued MIDI
   // is dropped, every voice of every part is cut, pedals are released and
   // controllers reset. Programs, patches and effects are kept. Not a MIDI
@@ -210,6 +226,8 @@ private:
 
 private:
   Settings *_settings = nullptr;
+
+  bool _gmLocked = false;
 
   // The SC-88 is not rendered by the Part and Note path: its engine reads the
   // control ROM itself and renders a stereo frame at a time off its own

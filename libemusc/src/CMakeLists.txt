@@ -456,4 +456,18 @@ if(BUILD_TESTING)
   set_target_properties(synth_rx_roland_only_test PROPERTIES CXX_EXTENSIONS OFF)
   add_test(NAME synth_rx_roland_only_test COMMAND synth_rx_roland_only_test)
   set_property(TEST synth_rx_roland_only_test PROPERTY SKIP_RETURN_CODE 77)
+
+  # has_gm_mode() and the GM lock. Needs the SC-55mkII ROMs, and checks
+  # has_gm_mode() on each other device whose ROMs are given.
+  add_executable(synth_gm_lock_test ../tests/synth_gm_lock_test.cc)
+  target_include_directories(synth_gm_lock_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_link_libraries(synth_gm_lock_test PRIVATE emusc_static)
+  if(MSVC)
+    target_compile_options(synth_gm_lock_test PRIVATE /UNDEBUG)
+  else()
+    target_compile_options(synth_gm_lock_test PRIVATE -UNDEBUG)
+  endif()
+  set_target_properties(synth_gm_lock_test PROPERTIES CXX_EXTENSIONS OFF)
+  add_test(NAME synth_gm_lock_test COMMAND synth_gm_lock_test)
+  set_property(TEST synth_gm_lock_test PROPERTY SKIP_RETURN_CODE 77)
 endif()
