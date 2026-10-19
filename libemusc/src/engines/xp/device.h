@@ -247,6 +247,11 @@ void device_reset_controllers(Device *device);
  * profile's firmwarePortGmMode says the device has a GM mode there. False,
  * with nothing changed, on a device that has no GM mode. */
 bool device_gm_system_on(Device *device);
+/* The receive switches GM System On turns off on the firmware port, Rx.Bank
+ * Select and Rx.NRPN on every part, turned off without the reset that comes
+ * before them. False, with nothing changed, on a device without a GM mode
+ * there. */
+bool device_gm_receive_off(Device *device);
 /* Whether device_gm_system_on() would act: the device has a GM mode. */
 bool device_has_gm_mode(const Device *device);
 /* Whether the device's own SysEx is GS: its model ID is GS's, 42H. */

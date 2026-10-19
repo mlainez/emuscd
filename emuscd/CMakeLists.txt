@@ -22,4 +22,12 @@ if(BUILD_TESTING)
   set_target_properties(midi_port_match_test PROPERTIES CXX_STANDARD 17 CXX_EXTENSIONS OFF)
   target_compile_options(midi_port_match_test PRIVATE -UNDEBUG)
   add_test(NAME midi_port_match_test COMMAND midi_port_match_test)
+
+  # power_on() on the SC-88: --reset gm enters GM mode. Needs the SC-88 ROMs.
+  add_executable(power_on_test tests/power_on_test.cc)
+  target_link_libraries(power_on_test PRIVATE emusc_static)
+  set_target_properties(power_on_test PROPERTIES CXX_STANDARD 17 CXX_EXTENSIONS OFF)
+  target_compile_options(power_on_test PRIVATE -UNDEBUG)
+  add_test(NAME power_on_test COMMAND power_on_test)
+  set_property(TEST power_on_test PROPERTY SKIP_RETURN_CODE 77)
 endif()

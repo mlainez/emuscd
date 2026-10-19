@@ -788,6 +788,14 @@ bool device_gm_system_on(Device *device)
      The firmware's reset reaches one module in MODE-2 and both in MODE-1;
      this reset, like the GS Reset here, reaches every part. */
   device_reset_controllers(device);
+  return device_gm_receive_off(device);
+}
+
+bool device_gm_receive_off(Device *device)
+{
+  if (!device || !device->initialized || device->voice_ops ||
+      !xp_profile(&device->renderer.rom)->firmwarePortGmMode)
+    return false;
   for (unsigned part = 0; part < XP_ENGINE_PART_COUNT; ++part) {
     device->channels[part].rx_bank_select = false;
     device->channels[part].rx_nrpn = false;
@@ -797,8 +805,11 @@ bool device_gm_system_on(Device *device)
 
 bool device_has_gm_mode(const Device *device)
 {
-  return device && device->initialized && device->voice_ops &&
-         device->voice_ops->gm_system_on;
+  if (!device || !device->initialized)
+    return false;
+  if (device->voice_ops)
+    return device->voice_ops->gm_system_on != nullptr;
+  return xp_profile(&device->renderer.rom)->firmwarePortGmMode;
 }
 
 bool device_has_gs_mode(const Device *device)

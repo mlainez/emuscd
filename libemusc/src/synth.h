@@ -155,8 +155,7 @@ public:
   // GM, and a parameter write cannot turn GM's receive switches back on. It
   // does not itself enter the mode: reset() does that. None, the default,
   // leaves the mode to the stream. A lock on a mode the device does not have
-  // is meaningless. The XP engine has no SysEx path from one of its modes to
-  // the other, so only the GP engine needs and reads it.
+  // is meaningless, so only a device with both modes reads it.
   enum class ModeLock { None, GS, GM };
   void set_mode_lock(ModeLock lock);
   ModeLock mode_lock(void) const { return _modeLock; }
@@ -349,6 +348,7 @@ private:
   void _apply_midi(uint8_t status, uint8_t data1, uint8_t data2,
                    int startDelay);
   void _apply_midi_sysex(uint8_t *data, uint16_t length);
+  void _xp_sysex(uint8_t port, const uint8_t *data, size_t size);
   int _partials_in_use(void);
   int _steal_partials(Gp::Part &requester);
   int _steal_partial_jv(Gp::Part &requester);
